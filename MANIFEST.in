@@ -1,6 +1,9 @@
 include CHANGELOG.md THREAT_MODEL.md CONTRIBUTING.md README.md LICENSE NOTICE AUTHORS
 include docs/*.md
 include examples/config.example.toml config/example.toml .env.example
+recursive-include scripts *
+recursive-include samples *
+include tests/conftest.py tests/hmac_fixtures.py
 global-exclude *.key *.sqlite3 *.sqlite3-* *.diff
 prune .agent
 exclude docs/review-*.md

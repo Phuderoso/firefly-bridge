@@ -7,7 +7,7 @@ or daemon modules (and without creating version/import cycles).
 from importlib import import_module
 from typing import TYPE_CHECKING
 
-__version__ = "0.4.0rc1"
+__version__ = "0.4.0"
 __all__ = ["Bridge", "Receipt", "__version__"]
 
 if TYPE_CHECKING:

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "firefly-bridge"
-version = "0.4.0rc1"
+version = "0.4.0"
 description = "Signed (HMAC), deny-by-default IPC and wake bridge for AI agent terminals."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -28,6 +28,12 @@ classifiers = [
   "Topic :: System :: Networking",
 ]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/Phuderoso/firefly-bridge"
+Repository = "https://github.com/Phuderoso/firefly-bridge"
+Issues = "https://github.com/Phuderoso/firefly-bridge/issues"
+Changelog = "https://github.com/Phuderoso/firefly-bridge/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.6"]

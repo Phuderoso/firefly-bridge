@@ -38,7 +38,7 @@ def test_all_timers_reject_nonfinite_direct_env_and_toml(field, value, tmp_path)
 def test_runtime_metadata_doctor_and_package_versions_agree(tmp_path):
     root = Path(__file__).parents[1]
     package_version = tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"]
-    assert __version__ == package_version == "0.4.0rc1"
+    assert __version__ == package_version == "0.4.0"
     assert doctor(BridgeConfig(state_dir=str(tmp_path)))["version"] == __version__
     source = (root / "firefly_bridge" / "daemon.py").read_text()
     assert '"version": __version__' in source
