@@ -397,7 +397,7 @@ history adapter returning the complete logical reply. Without either, completene
 is unproven/false. No real leader capability or history API was added/validated.
 
 Backward-compatible `from firefly_bridge import Bridge, Receipt` exports are
-restored lazily; runtime/project/doctor/initialize version is `0.4.0rc1`.
+restored lazily; runtime/project/doctor/initialize version is `0.4.0`.
 
 Wake versus tool is documented in [docs/WAKE_VS_TOOL.md](docs/WAKE_VS_TOOL.md).
 `kind: recado` is the default and is text only. `kind: tool_request` is also

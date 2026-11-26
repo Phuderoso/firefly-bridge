@@ -28,7 +28,7 @@ from firefly_bridge.messages import Receipt as InternalReceipt
 assert Bridge is InternalBridge and Receipt is InternalReceipt
 assert {"Bridge", "Receipt", "__version__"} <= set(firefly_bridge.__all__)
 assert {"Bridge", "Receipt"} <= set(dir(firefly_bridge))
-assert firefly_bridge.__version__ == "0.4.0rc1"
+assert firefly_bridge.__version__ == "0.4.0"
 try:
     firefly_bridge.nonexistent_export
 except AttributeError:
@@ -45,4 +45,4 @@ def test_rc4_runtime_and_project_version():
     from firefly_bridge import __version__
 
     project = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text())
-    assert __version__ == project["project"]["version"] == "0.4.0rc1"
+    assert __version__ == project["project"]["version"] == "0.4.0"

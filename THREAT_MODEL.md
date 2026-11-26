@@ -1,4 +1,4 @@
-# Threat model — 0.4.0-rc1
+# Threat model — 0.4.0
 
 Same-machine, same-user Unix broker; the local OS account and actual ACP leader
 are trusted. No cross-host or hostile-same-UID isolation is promised. No public
