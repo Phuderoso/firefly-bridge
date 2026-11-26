@@ -1,0 +1,31 @@
+{
+  "acp_speaker_field": null,
+  "attempt_committed": true,
+  "attribution_channel": "outbound-user-content",
+  "block_code": "timeout_no_resend",
+  "block_detail": "No correlated terminal result before the deadline.",
+  "correlation": {},
+  "history": [
+    "prepared",
+    "unknown"
+  ],
+  "message_id": "id_7c0d79090c4646af9db6cab266f2c8fa",
+  "methods": [
+    "session/prompt"
+  ],
+  "notes": [
+    "agent-a attribution is the 'agent-a: ' prefix in the user text block.",
+    "No ACP speaker field is sent.",
+    "Prepared does not mean a transport write.",
+    "2026-11-08T23:39:56+00:00"
+  ],
+  "outbound_text": "agent-a: synthetic agent note",
+  "outcome": "unknown",
+  "permission": null,
+  "resend_attempted": false,
+  "session_id": "sess-example-0001",
+  "source": "agent-a",
+  "text": "synthetic agent note",
+  "timeout_s": 0.2,
+  "transport": "mock"
+}

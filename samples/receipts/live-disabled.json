@@ -1,0 +1,28 @@
+{
+  "acp_speaker_field": null,
+  "attempt_committed": false,
+  "attribution_channel": "outbound-user-content",
+  "block_code": "live_transport_disabled",
+  "block_detail": "Live transport stays disabled. Non-interruption, composer preservation, and live attachment are not in the retrieved contract.",
+  "correlation": {},
+  "history": [
+    "prepared"
+  ],
+  "message_id": "id_f299e3c8dd6a4008879c5eb85e4c700d",
+  "notes": [
+    "agent-a attribution is the 'agent-a: ' prefix in the user text block.",
+    "No ACP speaker field is sent.",
+    "Prepared does not mean a transport write.",
+    "2026-11-08T23:39:56+00:00",
+    "no bytes written"
+  ],
+  "outbound_text": "agent-a: synthetic agent note",
+  "outcome": "prepared",
+  "permission": null,
+  "resend_attempted": false,
+  "session_id": "sess-example-0001",
+  "source": "agent-a",
+  "text": "synthetic agent note",
+  "timeout_s": 2.0,
+  "transport": "live"
+}

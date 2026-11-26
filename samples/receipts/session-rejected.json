@@ -1,0 +1,33 @@
+{
+  "acp_speaker_field": null,
+  "attempt_committed": true,
+  "attribution_channel": "outbound-user-content",
+  "block_code": "session_rejected",
+  "block_detail": "Pinned session was refused. session/new was not sent.",
+  "correlation": {},
+  "history": [
+    "prepared",
+    "unknown",
+    "prepared"
+  ],
+  "message_id": "id_2836e3d9b5224b64a7eec74a7e8192fd",
+  "methods": [
+    "session/prompt"
+  ],
+  "notes": [
+    "agent-a attribution is the 'agent-a: ' prefix in the user text block.",
+    "No ACP speaker field is sent.",
+    "Prepared does not mean a transport write.",
+    "2026-11-08T23:39:56+00:00",
+    "The request was written and refused. Outcome returns to prepared. attempt_committed blocks another exchange."
+  ],
+  "outbound_text": "agent-a: synthetic agent note",
+  "outcome": "prepared",
+  "permission": null,
+  "resend_attempted": false,
+  "session_id": "sess-other-9999",
+  "source": "agent-a",
+  "text": "synthetic agent note",
+  "timeout_s": 0.2,
+  "transport": "mock"
+}

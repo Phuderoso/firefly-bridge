@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""Dry-run knock: receive half of channel-call. Default refuses --live ACP attach."""
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+GATE = Path.home() / ".config" / "channel-wake" / "LIVE_GATE"
+DEFAULT_SOCK = "~/.grok/leader.sock"
+DEFAULT_SESSION = "sess-example-0001"
+
+
+def live_gates_open() -> bool:
+    return os.environ.get("CHANNEL_KNOCK_LIVE") == "1" and GATE.is_file()
+
+
+def intended_sequence(socket_path: str, session_id: str, text: str) -> str:
+    body = text if text.lstrip().startswith("[channel-wake") else f"[channel-wake] {text}"
+    return "\n".join(
+        [
+            "knock dry-run — receive half of channel-call. no socket bytes.",
+            f"socket: {socket_path}",
+            f"session_id: {session_id}",
+            "sequence:",
+            "  1. grok agent --leader --leader-socket SOCK stdio  (ephemeral client)",
+            "  2. initialize",
+            "  3. notifications/initialized",
+            "  4. session/load  (this connection; skip-load is unverified, not live)",
+            f"  5. session/prompt text={body!r}",
+            "  6. session/request_permission → wake_origin_permission_result",
+            "     (reject_once / cancelled; agent-a never Allow)",
+            "  7. --no-wait after queue ack (do not sit 600s)",
+            "not daemon IPC as the knock transport.",
+            "VIP speaker: channel-bot, de:, signature — never GitHub login.",
+            "fallback: para: peerb on canal PR#1.",
+            "no launchd.",
+        ]
+    )
+
+
+def _presence_module():
+    """Lazy: only --presence loads firefly_bridge.presence (installed, else this checkout)."""
+    try:
+        from firefly_bridge import presence  # type: ignore[import-not-found]
+    except ImportError:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from firefly_bridge import presence  # type: ignore[import-not-found]
+    return presence
+
+
+def presence_check(
+    sender: str,
+    target: str,
+    config: str | None,
+    now: float | None,
+    body: str = "",
+    created_at: str = "",
+    nonce_store: str | None = None,
+    claim: bool = False,
+) -> dict:
+    """DRY-RUN: wake_gate (VIP + channel-sig) + presence (target heartbeat file). Reads the replay ledger (writes only with claim=True); never wakes anything."""
+    import time
+
+    pr = _presence_module()
+    sp = pr.sp
+    sp.use_config(config)
+    roster = sp.load_vip_roster(config)
+    cfg = pr.load_presence_config(config)
+    keyring = sp.load_keyring(config)
+    d = pr.wake_decision(
+        sender,
+        target=target,
+        own_aliases=[target],
+        roster=roster,
+        now=time.time() if now is None else now,
+        sources=[pr.state_file_source(cfg)],
+        cfg=cfg,
+        body=body,
+        keyring=keyring,
+        created_at=created_at,
+        nonce_store=nonce_store,  # None = presence_nonces.default_nonce_path(), same as the queue
+        claim=claim,
+    )
+    return {
+        "action": d.action,
+        "sender": d.sender,
+        "principal": d.principal,
+        "target": d.target,
+        "presence": d.presence,
+        "reason": d.reason,
+        "retry_owner": d.retry_owner,
+        "ledger": "claimed" if claim else "read_only",
+    }
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="channel-knock",
+        description="Dry-run knock (ACP receive half of channel-call). Default: no live attach.",
+    )
+    parser.add_argument("--socket", default=DEFAULT_SOCK, help="Leader socket (placeholder default)")
+    parser.add_argument("--session-id", default=DEFAULT_SESSION)
+    parser.add_argument("--text", default="oi peerb")
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help="Refused unless CHANNEL_KNOCK_LIVE=1 and the owner gate file exist",
+    )
+    parser.add_argument(
+        "--presence",
+        action="store_true",
+        help="DRY-RUN: print the wake/deferred_* decision (VIP gate + target heartbeat); wakes nothing",
+    )
+    parser.add_argument("--from", dest="sender", default="", help="--presence: declared sender")
+    parser.add_argument("--body", default="", help="--presence: signed channel body to verify")
+    parser.add_argument("--created-at", default="", help="--presence: GitHub API created_at; absent uses local UTC receive time")
+    parser.add_argument("--nonce-store", default=None, help="--presence: persistent 0600 replay ledger (default: the queue's, $CHANNEL_PRESENCE_NONCES or ~/.local/state/firefly-bridge/presence-nonces.json)")
+    parser.add_argument("--claim", action="store_true", help="--presence: spend the nonce on wake (default: read the ledger only, write nothing)")
+    parser.add_argument("--target", default="peerb", help="--presence: terminal to knock on")
+    parser.add_argument("--config", default=None, help="--presence: config.toml (roster + presence)")
+    parser.add_argument("--now", type=float, default=None, help=argparse.SUPPRESS)  # tests only
+    parser.add_argument("--presence-log", default=None, help="--presence: append the decision as JSONL")
+    return parser
+
+
+def run_presence(args) -> int:
+    import json
+
+    if args.live:
+        print("presence_refused: --presence is dry-run only; drop --live", file=sys.stderr)
+        return 2
+    rec = presence_check(args.sender, args.target, args.config, args.now, body=args.body,
+                         created_at=args.created_at, nonce_store=args.nonce_store,
+                         claim=args.claim)
+    # --claim writes the ledger, so it is not labelled dry-run (it still never knocks)
+    mode = "claim" if args.claim else "dry_run"
+    label = "claim" if args.claim else "dry-run"
+    print(f"presence ({label}): " + " ".join(f"{k}={v}" for k, v in rec.items()))
+    if args.presence_log:
+        with open(os.path.expanduser(args.presence_log), "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(dict(rec, mode=mode), ensure_ascii=False) + "\n")
+    if rec["action"] == "wake":
+        print(intended_sequence(args.socket, args.session_id, args.text))
+    else:
+        print(f"knock: not attempted ({rec['action']}); nothing woken, nothing queued here")
+    if args.claim:
+        print("live: not requested (--claim spent the nonce only; nothing was knocked)")
+    else:
+        print("live: not requested (presence is dry-run only)")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.presence:
+        return run_presence(args)
+    print(intended_sequence(args.socket, args.session_id, args.text))
+    if not args.live:
+        print("live: not requested (default dry-run)")
+        return 0
+    if not live_gates_open():
+        print(
+            "live_refused: need CHANNEL_KNOCK_LIVE=1 and gate file "
+            f"{GATE} — no ACP attach",
+            file=sys.stderr,
+        )
+        return 2
+    print(
+        "live_refused: gates open but this commit does not attach; "
+        "no session/prompt, no leader socket connect",
+        file=sys.stderr,
+    )
+    return 3
+
+
+if __name__ == "__main__":
+    sys.exit(main())

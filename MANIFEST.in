@@ -1,0 +1,6 @@
+include CHANGELOG.md THREAT_MODEL.md CONTRIBUTING.md README.md LICENSE NOTICE AUTHORS
+include docs/*.md
+include examples/config.example.toml config/example.toml .env.example
+global-exclude *.key *.sqlite3 *.sqlite3-* *.diff
+prune .agent
+exclude docs/review-*.md

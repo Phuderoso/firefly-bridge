@@ -1,0 +1,50 @@
+{
+  "acp_speaker_field": null,
+  "attempt_committed": true,
+  "attribution_channel": "outbound-user-content",
+  "block_code": null,
+  "block_detail": null,
+  "correlation": {
+    "acp_acceptance_ack_documented": false,
+    "assistant_text": "mock reply correlated",
+    "ids_match": true,
+    "jsonrpc_id": "id_c909115e930f419cbcf0cd7060e22690",
+    "mock_acceptance": true,
+    "result_id": "id_c909115e930f419cbcf0cd7060e22690",
+    "stop_reason": "end_turn"
+  },
+  "history": [
+    "prepared",
+    "unknown",
+    "transport-accepted",
+    "responded"
+  ],
+  "message_id": "id_c909115e930f419cbcf0cd7060e22690",
+  "methods": [
+    "session/prompt"
+  ],
+  "notes": [
+    "agent-a attribution is the 'agent-a: ' prefix in the user text block.",
+    "No ACP speaker field is sent.",
+    "Prepared does not mean a transport write.",
+    "2026-11-08T23:39:56+00:00"
+  ],
+  "outbound_text": "agent-a: synthetic agent note",
+  "outcome": "responded",
+  "permission": {
+    "always_approve": false,
+    "how": "reject_once",
+    "outcome": {
+      "optionId": "reject-once",
+      "outcome": "selected"
+    },
+    "privileges_changed": false,
+    "tools_executed": []
+  },
+  "resend_attempted": false,
+  "session_id": "sess-example-0001",
+  "source": "agent-a",
+  "text": "synthetic agent note",
+  "timeout_s": 0.2,
+  "transport": "mock"
+}

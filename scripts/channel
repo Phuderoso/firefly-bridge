@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Channel CLI wrapper (agent-a -> peera-peerb)
+# Resolve o pacote relativo a este script (funciona na copia this checkout
+# e no this checkout vivo). Exige --live para contato real com a peerb.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PACKAGE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+if [[ -x "python3" ]]; then
+  PY="python3"
+elif command -v python3 >/dev/null 2>&1; then
+  PY="$(command -v python3)"
+else
+  echo '{"error": "python3_not_found"}' >&2
+  exit 2
+fi
+
+export PYTHONPATH="${PACKAGE_DIR}${PYTHONPATH:+:$PYTHONPATH}"
+
+if [[ $# -eq 0 ]]; then
+  exec "$PY" -m firefly_bridge channel --help
+fi
+
+case "$1" in
+  watch-wake|doctor|status|preflight|mac-preflight|send|prepare|enqueue|cancel|receipt|control|keygen|verify|daemon)
+    subcmd="$1"
+    shift
+    exec "$PY" -m firefly_bridge "$subcmd" "$@"
+    ;;
+  --*)
+    exec "$PY" -m firefly_bridge channel "$@"
+    ;;
+  *)
+    text="$1"
+    shift
+    exec "$PY" -m firefly_bridge channel --text "$text" "$@"
+    ;;
+esac

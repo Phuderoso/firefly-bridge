@@ -1,0 +1,65 @@
+{
+  "busy_query_documented": false,
+  "coordinated_restart_performed": false,
+  "disk_load_is_live_attachment": false,
+  "gates": [
+    {
+      "detail": "Vendor text does not say a second client joins the running TUI session.",
+      "id": "contract_attach",
+      "pass": false
+    },
+    {
+      "detail": "No documented busy query or non-steering queue. Do not send.",
+      "id": "noninterruption",
+      "pass": false
+    },
+    {
+      "detail": "Draft-buffer preservation is not documented.",
+      "id": "composer",
+      "pass": false
+    },
+    {
+      "detail": "agent-a is not a documented ACP speaker. Receipt attribution only.",
+      "id": "speaker",
+      "pass": false
+    },
+    {
+      "detail": "The documented existing-session ACP method is session/load, which replays history.",
+      "id": "not_disk_load",
+      "pass": false
+    },
+    {
+      "detail": "leader_process_listed. This is not session attachment, not an idle flag, and not permission to prompt.",
+      "id": "leader_observed",
+      "informational": true,
+      "pass": false
+    },
+    {
+      "detail": "pinned id appeared in grok sessions list output for the given cwd. That is index visibility, not a live attach, and the summary text was discarded.",
+      "id": "session_pinned_seen",
+      "informational": true,
+      "pass": false
+    },
+    {
+      "detail": "This preflight does not restart peerb or edit config. A restart would be a separate coordinated change and still would not open the send gate.",
+      "id": "no_restart",
+      "pass": true
+    }
+  ],
+  "leader_interpretation": "leader_process_listed. This is not session attachment, not an idle flag, and not permission to prompt.",
+  "live_send_allowed": false,
+  "noninterruption_guaranteed": false,
+  "observation": {
+    "grok_found": true,
+    "leader_count": 1,
+    "leader_json_shape": "list",
+    "leader_list_ran": true,
+    "pinned_session_id_seen": true,
+    "secrets_redacted": true,
+    "sessions_list_ran": true
+  },
+  "retrieved": "2026-11-08",
+  "send_authorized_by_passing_gates": false,
+  "send_remains_blocked_because": "Non-interruption is not guaranteed by the retrieved contract. session/load remains a history replay. This report does not authorize a send.",
+  "session_interpretation": "pinned id appeared in grok sessions list output for the given cwd. That is index visibility, not a live attach, and the summary text was discarded."
+}

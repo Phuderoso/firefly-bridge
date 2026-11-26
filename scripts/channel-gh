@@ -1,0 +1,1074 @@
+#!/usr/bin/env python3
+"""Async GitHub PR comment channel between Grok TUI terminals and Grok Bot bots.
+
+Repo and PR number come from ~/.config/firefly-bridge/config.toml
+([github_canal] repo, pr) or FIREFLY_BRIDGE_GITHUB_CANAL_REPO /
+FIREFLY_BRIDGE_GITHUB_CANAL_PR. No deployment defaults are compiled in.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable
+
+
+def _load_speaker():
+    try:
+        from firefly_bridge import speaker as _sp  # type: ignore[import-not-found]
+
+        return _sp
+    except ImportError:
+        pass
+    import importlib.util
+
+    here = Path(os.path.realpath(__file__)).parent
+    for cand in (
+        os.environ.get("FIREFLY_BRIDGE_SPEAKER", ""),
+        str(here.parent / "firefly_bridge" / "speaker.py"),
+        str(here / "firefly_bridge" / "speaker.py"),
+    ):
+        if cand and Path(cand).is_file():
+            spec = importlib.util.spec_from_file_location("firefly_bridge_speaker", cand)
+            if spec and spec.loader:
+                mod = importlib.util.module_from_spec(spec)
+                sys.modules.setdefault("firefly_bridge_speaker", mod)
+                spec.loader.exec_module(mod)
+                return mod
+    raise SystemExit(
+        "speaker_module_missing: install firefly-bridge or set FIREFLY_BRIDGE_SPEAKER=/path/speaker.py"
+    )
+
+
+speaker = _load_speaker()
+RELAY_MARK = speaker.RELAY_MARK
+BOT_MARK_RE = speaker.BOT_MARK_RE
+CHANNEL_BOT_RE = BOT_MARK_RE
+HEADER_RE = speaker.HEADER_RE
+SIGNATURE_RE = speaker.SIGNATURE_RE
+leading_html_comments = speaker.leading_html_comments
+bot_marker_name = speaker.bot_marker_name
+channel_bot_name = speaker.bot_marker_name
+is_agent_relay = speaker.is_agent_relay
+is_relay_comment = speaker.is_relay_comment
+parse_headers = speaker.parse_headers
+parse_signature = speaker.parse_signature
+comment_sender = speaker.comment_sender
+names_match = speaker.names_match
+SIG_LINE_RE = speaker.SIG_LINE_RE  # canal HMAC trailer: one format, defined in speaker
+sign_body = speaker.sign_body
+split_signature = speaker.split_signature
+verify_comment = speaker.verify_comment
+REPLY_TO_RE = re.compile(r"<!--\s*reply-to:\s*(\d+)\s*-->", re.IGNORECASE)
+ISSUECOMMENT_RE = re.compile(r"#issuecomment-(\d+)")
+# Compatible with worker's canal markers; HMAC trailer = speaker.SIG_LINE_RE.
+FORWARD_MARK_RE = re.compile(
+    r"<!--\s*channel-forward\s*:\s*para-original=([^<>]*?)\s*-->", re.IGNORECASE
+)
+ACK_MARK_RE = re.compile(r"<!--\s*channel-ack:\s*([^<>]*?)\s*-->", re.IGNORECASE)
+CID_MARK_RE = re.compile(r"<!--\s*channel-cid:\s*([^<>]*?)\s*-->", re.IGNORECASE)
+GH_TRANSIENT_RE = re.compile(
+    r"timeout|timed out|temporar|rate limit|429|502|503|504|connection reset|"
+    r"connection refused|eof|network|i/o timeout|connect(?:ion)? (?:error|failed)",
+    re.IGNORECASE,
+)
+DISPLAY_TZ = os.environ.get("CHANNEL_TZ", "UTC")
+DEFAULT_CONFIG_REL = Path("firefly-bridge") / "config.toml"
+POLL_SECONDS = 20
+WAIT_GH_RETRIES = 5  # consecutive transient gh failures tolerated inside --wait
+GH_FATAL_RE = re.compile(r"\b40[134]\b|auth|credential|not found", re.IGNORECASE)
+
+
+def default_config_path() -> Path:
+    override = os.environ.get("FIREFLY_BRIDGE_CONFIG")
+    if override:
+        return Path(os.path.expanduser(os.path.expandvars(override)))
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".config"
+    return base / DEFAULT_CONFIG_REL
+
+
+def _unquote(raw: str) -> str:
+    value = raw.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return value
+
+
+def parse_github_canal_toml(text: str) -> dict[str, str]:
+    """Read only the [github_canal] table; ignore sibling sections."""
+    data: dict[str, str] = {}
+    in_section = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            in_section = line[1:-1].strip() == "github_canal"
+            continue
+        if not in_section or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        data[key.strip()] = _unquote(value)
+    return data
+
+
+def load_canal_config(path: Path | None = None) -> dict[str, str]:
+    cfg_path = path or default_config_path()
+    found: dict[str, str] = {}
+    if cfg_path.is_file():
+        found = parse_github_canal_toml(cfg_path.read_text(encoding="utf-8"))
+    repo = os.environ.get("FIREFLY_BRIDGE_GITHUB_CANAL_REPO", "").strip() or found.get("repo", "")
+    pr = os.environ.get("FIREFLY_BRIDGE_GITHUB_CANAL_PR", "").strip() or found.get("pr", "")
+    return {"repo": repo, "pr": str(pr), "config_path": str(cfg_path)}
+
+
+def default_sender() -> str:
+    env = os.environ.get("CHANNEL_FROM", "").strip()
+    if env:
+        return env
+    host = socket.gethostname().split(".")[0] or "host"
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or "user"
+    return f"{host}-{user}"
+
+
+def resolve_sender(requested: str | None, cfg: dict[str, str]) -> tuple[str, bytes | None]:
+    """With `[channel_identity]` bound, --from/CHANNEL_FROM may only repeat that name and the
+    post is signed. Unbound (no identity): legacy, unchanged and unsigned."""
+    try:
+        name, key = speaker.bound_identity(cfg.get("config_path") or None)
+    except speaker.KeyFileError as exc:
+        raise SystemExit(f"identity_error: {exc}") from exc
+    asked = (requested or "").strip() or os.environ.get("CHANNEL_FROM", "").strip()
+    if name:
+        if asked and speaker.norm_name(asked) != speaker.norm_name(name):
+            raise SystemExit(
+                f"sender_mismatch: this terminal is bound to {name!r}; refusing to post as {asked!r}"
+            )
+        return name, key
+    return (requested or default_sender()), None
+
+
+def _ends_with_sender_signature(message: str, sender: str) -> bool:
+    lines = [ln for ln in (message or "").strip("\n").splitlines() if ln.strip()]
+    if not lines:
+        return False
+    match = SIGNATURE_RE.match(lines[-1].strip())
+    return bool(match and match.group(1).strip() == sender.strip())
+
+
+def _marker_value(value: str | int) -> str:
+    text = " ".join(str(value).split())
+    if not text or "<!--" in text or "-->" in text:
+        raise ValueError("invalid marker value")
+    return text
+
+
+def _append_canal_markers(
+    body: str,
+    *,
+    forward_for: str | None = None,
+    ack_of: str | int | None = None,
+    client_id: str | int | None = None,
+) -> str:
+    extra: list[str] = []
+    if forward_for:
+        extra.append(f"<!-- channel-forward: para-original={_marker_value(forward_for)} -->")
+    if ack_of is not None and str(ack_of).strip():
+        extra.append(f"<!-- channel-ack: {_marker_value(ack_of)} -->")
+    if client_id is not None and str(client_id).strip():
+        extra.append(f"<!-- channel-cid: {_marker_value(client_id)} -->")
+    if not extra:
+        return body
+    if not body.endswith("\n"):
+        body += "\n"
+    return body + "\n".join(extra) + "\n"
+
+
+def format_send_body(
+    bot: str,
+    message: str,
+    sender: str,
+    *,
+    forward_for: str | None = None,
+    ack_of: str | int | None = None,
+    client_id: str | int | None = None,
+) -> str:
+    bot = bot.strip()
+    message = message.strip("\n")
+    sender = sender.strip()
+    if not bot:
+        raise ValueError("bot name is required")
+    if not message.strip():
+        raise ValueError("message is required")
+    if not sender:
+        raise ValueError("sender is required")
+    if _ends_with_sender_signature(message, sender):
+        body = f"para: {bot}\n\n{message.strip()}\n"
+    else:
+        body = f"para: {bot}\n\n{message}\n\n— {sender}\n"
+    return _append_canal_markers(
+        body, forward_for=forward_for, ack_of=ack_of, client_id=client_id
+    )
+
+
+def forward_target(body: str) -> str:
+    match = FORWARD_MARK_RE.search(body or "")
+    return match.group(1).strip() if match else ""
+
+
+def parse_iso(ts: str) -> datetime:
+    text = ts.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    dt = datetime.fromisoformat(text)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def comment_is_newer(created_at: str, since: datetime | None) -> bool:
+    if since is None:
+        return True
+    return parse_iso(created_at) > since
+
+
+def _gh_transient(returncode: int, err: str) -> bool:
+    if returncode == 0:
+        return False
+    if returncode in (124, 128):
+        return True
+    return bool(GH_TRANSIENT_RE.search(err or ""))
+
+
+def run_gh(
+    args: list[str],
+    gh: str = "gh",
+    *,
+    attempts: int = 3,
+    sleeper: Callable[[float], None] | None = None,
+) -> str:
+    """Run ``gh``. Transient failures retry with backoff (2–3 tries)."""
+    sleep = sleeper or time.sleep
+    cmd = [gh, *args]
+    last_err = "gh failed"
+    delay = 0.4
+    tries = max(1, min(int(attempts), 3))
+    for i in range(tries):
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode == 0:
+            return proc.stdout
+        last_err = (proc.stderr or proc.stdout or "gh failed").strip()
+        if i + 1 >= tries or not _gh_transient(proc.returncode, last_err):
+            raise SystemExit(f"gh_error: {last_err}")
+        sleep(delay)
+        delay *= 2
+    raise SystemExit(f"gh_error: {last_err}")
+
+
+def send_comment(
+    bot: str,
+    message: str,
+    sender: str,
+    repo: str,
+    pr: str,
+    gh: str = "gh",
+    runner: Callable[[list[str], str], str] = run_gh,
+    *,
+    forward_for: str | None = None,
+    ack_of: str | int | None = None,
+    client_id: str | int | None = None,
+    sign_key: bytes | None = None,
+) -> str:
+    body = format_send_body(
+        bot,
+        message,
+        sender,
+        forward_for=forward_for,
+        ack_of=ack_of,
+        client_id=client_id,
+    )
+    if sign_key is not None:
+        body = sign_body(body, sender, sign_key)
+    out = runner(["pr", "comment", str(pr), "--repo", repo, "--body", body], gh)
+    return out.strip()
+
+
+def list_issue_comments(
+    repo: str,
+    pr: str,
+    gh: str = "gh",
+    runner: Callable[[list[str], str], str] = run_gh,
+) -> list[dict[str, Any]]:
+    raw = runner(
+        [
+            "api",
+            "--paginate",
+            f"repos/{repo}/issues/{pr}/comments",
+        ],
+        gh,
+    ).strip()
+    return parse_gh_comment_list(raw)
+
+
+def parse_gh_comment_list(raw: str) -> list[dict[str, Any]]:
+    """Parse `gh api --paginate` output (one array, concatenated arrays, or ndjson)."""
+    text = raw.strip()
+    if not text:
+        return []
+    if "][" in text:
+        chunks = text.replace("][", "]" + "\n" + "[").splitlines()
+    else:
+        chunks = [text]
+    comments: list[dict[str, Any]] = []
+    for chunk in chunks:
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        try:
+            payload = json.loads(chunk)
+        except json.JSONDecodeError:
+            payload = [json.loads(line) for line in chunk.splitlines() if line.strip()]
+        if isinstance(payload, list):
+            comments.extend(payload)
+        else:
+            comments.append(payload)
+    return comments
+
+
+def comment_id(comment: dict[str, Any]) -> int | None:
+    value = comment.get("id")
+    return value if isinstance(value, int) else None
+
+
+def max_comment_id(comments: list[dict[str, Any]]) -> int:
+    ids = [cid for cid in (comment_id(c) for c in comments) if cid is not None]
+    return max(ids) if ids else 0
+
+
+def is_transient_gh_error(exc: BaseException) -> bool:
+    msg = str(exc.code if isinstance(exc, SystemExit) else exc)
+    if "rate limit" in msg.lower():
+        return True  # GitHub answers rate limits with 403/429; worth a backoff
+    if GH_FATAL_RE.search(msg):
+        return False
+    return bool(GH_TRANSIENT_RE.search(msg))
+
+
+def wait_poll(
+    args: argparse.Namespace,
+    cfg: dict[str, str],
+    runner: Callable[..., str],
+    deadline: float | None,
+    failed: list[BaseException],
+) -> list[dict[str, Any]] | None:
+    """One poll. Inside --wait, a transient gh failure returns None (caller backs off).
+
+    Auth/not-found errors, retries exhausted, or no --wait still raise as before.
+    ``failed`` holds the consecutive transient errors (cleared on success).
+    """
+    try:
+        comments = list_issue_comments(cfg["repo"], cfg["pr"], gh=args.gh, runner=runner)
+    except (SystemExit, OSError) as exc:
+        if deadline is None or not is_transient_gh_error(exc) or len(failed) >= WAIT_GH_RETRIES:
+            raise
+        failed.append(exc)
+        return None
+    failed.clear()
+    return comments
+
+
+def wait_timed_out(deadline: float | None, failed: list[BaseException]) -> bool:
+    if deadline is None or time.monotonic() < deadline:
+        return False
+    if failed:
+        raise failed[-1]  # the wait ended on a gh failure: report it, not an empty inbox
+    return True
+
+
+def unshown_floor(addressed: list[dict[str, Any]], shown: list[dict[str, Any]], last: int) -> int:
+    """Cursor for --mark-read: never past an addressed comment that was not shown.
+
+    Old unread hidden by the --wait floor stays unread (next run shows it, plus
+    the shown items once more): a repeat is better than a silent loss.
+    """
+    seen = {i["id"] for i in shown}
+    hidden = [i["id"] for i in addressed if i["id"] not in seen and i["id"] < last]
+    return min(last, min(hidden) - 1) if hidden else last
+
+
+def trusted_inbox(
+    items: list[dict[str, Any]],
+    *,
+    keyring: dict[str, bytes] | None,
+    legacy_unsigned: bool,
+) -> list[dict[str, Any]]:
+    """Items that may wake ``--wait`` or advance ``--mark-read``.
+
+    With a keyring and without ``legacy_unsigned_wake``, only a verified
+    channel-sig counts. Unsigned or forged comments can still be shown
+    (marked unverified) but they do not move the id floor or end a wait.
+    With a keyring and ``legacy_unsigned_wake``, unsigned mail (no
+    signature) also counts; a present-but-invalid signature (bad_mac,
+    sender_mismatch, stale, replayed_nonce) never does. No keyring keeps
+    the pre-HMAC read rule (every addressed item counts).
+    """
+    if not keyring:
+        return list(items)
+    if legacy_unsigned:  # legacy covers unsigned mail, never a present-but-invalid signature
+        return [i for i in items if i.get("auth") not in speaker.AUTH_FORGED]
+    return [i for i in items if i.get("verified") or i.get("auth") == speaker.AUTH_VERIFIED]
+
+
+def wait_sleep(deadline: float | None, failures: int) -> None:
+    step = min(POLL_SECONDS, 2 ** failures) if failures else POLL_SECONDS
+    remaining = (deadline - time.monotonic()) if deadline is not None else step
+    time.sleep(min(step, max(0, remaining)))
+
+
+def inbox_comments(
+    comments: list[dict[str, Any]],
+    since: datetime | None,
+    *,
+    after_id: int | None = None,
+) -> list[dict[str, Any]]:
+    items = []
+    for comment in comments:
+        body = comment.get("body") or ""
+        created = comment.get("created_at") or ""
+        cid = comment_id(comment)
+        if not is_relay_comment(body):
+            continue
+        if after_id is not None and (cid is None or cid <= after_id):
+            continue
+        if since is not None and (not created or not comment_is_newer(created, since)):
+            continue
+        user = comment.get("user") or {}
+        login = user.get("login") if isinstance(user, dict) else ""
+        items.append(
+            {
+                "id": comment.get("id"),
+                "created_at": created,
+                "html_url": comment.get("html_url") or "",
+                "author": login,
+                "body": body,
+            }
+        )
+    items.sort(key=lambda c: (c["id"] is None, c["id"] or 0, c["created_at"]))
+    return items
+
+
+# --- addressed inbox (two-way delivery for terminals) -------------------------
+
+
+def reply_to_id(body: str) -> int | None:
+    match = REPLY_TO_RE.search(body or "") or ISSUECOMMENT_RE.search(body or "")
+    return int(match.group(1)) if match else None
+
+
+def strip_headers(body: str) -> str:
+    """Drop the relay marker, header lines and HTML comments for display."""
+    out: list[str] = []
+    in_header = True
+    for raw in (body or "").splitlines():
+        line = raw.strip()
+        if line.startswith("<!--") and line.endswith("-->"):
+            continue
+        if in_header:
+            if not line or HEADER_RE.match(line):
+                continue
+            in_header = False
+        out.append(raw.rstrip())
+    while out and not out[-1].strip():
+        out.pop()
+    if out and SIGNATURE_RE.match(out[-1]):
+        out.pop()  # the sender is already shown in the item header
+    return "\n".join(out).strip()
+
+
+def relay_original_sender(
+    relay: dict[str, Any],
+    comments: list[dict[str, Any]],
+) -> str:
+    """Best-effort: who sent the message that this relay answers.
+
+    Order: explicit reply-to/issuecomment id, then the latest earlier non-relay
+    comment addressed (`para:`) to the relay's `de:` bot.
+    """
+    body = relay.get("body") or ""
+    by_id = {c.get("id"): c for c in comments}
+    target = reply_to_id(body)
+    if target is not None and target in by_id:
+        return parse_signature(by_id[target].get("body") or "")
+    bot = parse_headers(body).get("de", "") or channel_bot_name(body)
+    if not bot:
+        return ""
+    created = relay.get("created_at") or ""
+    best: dict[str, Any] | None = None
+    for comment in comments:
+        cbody = comment.get("body") or ""
+        if is_relay_comment(cbody):
+            continue
+        if (comment.get("created_at") or "") >= created:
+            continue
+        if not names_match(parse_headers(cbody).get("para", ""), _name_list(bot)):
+            continue
+        if best is None or (comment.get("created_at") or "") > (best.get("created_at") or ""):
+            best = comment
+    return parse_signature(best.get("body") or "") if best else ""
+
+
+def _name_list(value: str) -> list[str]:
+    value = (value or "").strip()
+    return [value] if value else []
+
+
+def is_addressed_to(
+    comment: dict[str, Any],
+    aliases: list[str],
+    comments: list[dict[str, Any]],
+) -> bool:
+    body = comment.get("body") or ""
+    headers = parse_headers(body)
+    if headers.get("para") and names_match(headers["para"], aliases):
+        # A note someone addressed to these aliases; skip self-sent notes
+        # (signature or own channel-bot marker). agent-a-relay is vouched, not self.
+        sender = comment_sender(body)
+        if sender and names_match(sender, aliases) and not is_agent_relay(body):
+            return False
+        return is_relay_comment(body) or not names_match(parse_signature(body), aliases)
+    if is_relay_comment(body) and not headers.get("para"):
+        return names_match(relay_original_sender(comment, comments), aliases)
+    return False
+
+
+def addressed_inbox(
+    comments: list[dict[str, Any]],
+    aliases: list[str],
+    after_id: int | None,
+    keyring: dict[str, bytes] | None = None,
+) -> list[dict[str, Any]]:
+    items = []
+    seen_nonces: dict[str, int] = {}
+    checks = {}
+    # verify every comment in id order so a replayed nonce is caught wherever it reappears
+    for comment in sorted(comments, key=lambda c: c.get("id") if isinstance(c.get("id"), int) else -1):
+        if isinstance(comment.get("id"), int):
+            checks[comment["id"]] = verify_comment(
+                comment, keyring, seen_nonces, expected_recipient=aliases or None
+            )
+    for comment in comments:
+        cid = comment.get("id")
+        if not isinstance(cid, int):
+            continue
+        if after_id is not None and cid <= after_id:
+            continue
+        if not is_addressed_to(comment, aliases, comments):
+            continue
+        body = comment.get("body") or ""
+        user = comment.get("user") or {}
+        login = user.get("login") if isinstance(user, dict) else ""
+        spk = speaker.resolve_speaker(body, login=login)
+        items.append(
+            {
+                "id": cid,
+                "created_at": comment.get("created_at") or "",
+                "html_url": comment.get("html_url") or "",
+                "author": login,
+                "from": spk.name,
+                "speaker_source": spk.source,
+                "relay": is_relay_comment(body),
+                "relay_by": spk.relay_by,
+                "text": strip_headers(body),
+                "auth": checks[cid].auth,
+                "verified": checks[cid].verified,
+                "signed_by": checks[cid].signed_by,
+            }
+        )
+    items.sort(key=lambda c: c["id"])
+    return items
+
+
+def format_local_time(ts: str, tz_name: str = DISPLAY_TZ) -> str:
+    if not ts:
+        return "?"
+    dt = parse_iso(ts)
+    try:
+        from zoneinfo import ZoneInfo
+
+        local = dt.astimezone(ZoneInfo(tz_name))
+    except Exception:
+        local = dt
+    return local.strftime("%Y-%m-%d %H:%M %Z")
+
+
+def format_inbox_text(
+    items: list[dict[str, Any]], tz_name: str = DISPLAY_TZ, *, legacy_unsigned: bool = False
+) -> str:
+    """Every message is shown in full; anything not verified is marked (it cannot wake anybody).
+    `legacy_unsigned` (config opt-in) keeps the pre-HMAC display for the no-keyring case."""
+    blocks = []
+    quiet = (speaker.AUTH_VERIFIED, speaker.AUTH_NO_KEYRING) if legacy_unsigned else (speaker.AUTH_VERIFIED,)
+    for item in items:
+        who = item.get("from") or "?"
+        via = " via relay" if item.get("relay") else ""
+        auth = item.get("auth")
+        if auth and auth not in quiet:
+            via += f" (não verificado: {auth})"
+        head = f"#{item['id']} · {format_local_time(item.get('created_at', ''), tz_name)} · de: {who}{via}"
+        blocks.append(f"{head}\n{item.get('text', '')}".rstrip())
+    return "\n---\n".join(blocks)
+
+
+def default_state_dir() -> Path:
+    override = os.environ.get("CHANNEL_STATE_DIR", "").strip()
+    if override:
+        return Path(os.path.expanduser(os.path.expandvars(override)))
+    return Path.home() / ".grok" / "channel"
+
+
+def canonical_alias_key(aliases: list[str]) -> str:
+    """Sorted lower names joined — ``peerb,peera`` and ``peera,peerb`` share a cursor."""
+    parts = sorted({a.strip().lower() for a in aliases if a and a.strip()})
+    return ",".join(parts) if parts else "default"
+
+
+# Cursor files stay here (--wait id floor: wait_poll/unshown_floor above). Shared schema:
+# firefly_bridge.canal_cursor.
+
+
+def cursor_path(name: str, state_dir: Path | None = None) -> Path:
+    slug = re.sub(r"[^a-z0-9_-]+", "_", name.strip().lower()) or "default"
+    return (state_dir or default_state_dir()) / f"last_seen_{slug}.json"
+
+
+def cursor_path_for_aliases(aliases: list[str], state_dir: Path | None = None) -> Path:
+    return cursor_path(canonical_alias_key(aliases), state_dir)
+
+
+def read_cursor_for_aliases(aliases: list[str], state_dir: Path | None = None) -> tuple[int | None, Path]:
+    """Read the canonical cursor; fall back to aliases[0] (legacy last_seen_peerb.json)."""
+    path = cursor_path_for_aliases(aliases, state_dir)
+    value = read_cursor(path)
+    if value is not None or not aliases:
+        return value, path
+    legacy = cursor_path(aliases[0], state_dir)
+    if legacy != path:
+        return read_cursor(legacy), path
+    return None, path
+
+
+def read_cursor(path: Path) -> int | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    value = data.get("last_id") if isinstance(data, dict) else None
+    return int(value) if isinstance(value, int) else None
+
+
+def write_cursor(path: Path, last_id: int) -> None:
+    current = read_cursor(path)
+    if current is not None and current >= last_id:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(
+        json.dumps(
+            {"last_id": last_id, "updated_at": datetime.now(timezone.utc).isoformat()},
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    os.replace(tmp, path)
+
+
+def parse_aliases(values: list[str] | None) -> list[str]:
+    aliases: list[str] = []
+    for value in values or []:
+        for part in value.split(","):
+            part = part.strip()
+            if part and part.lower() not in {a.lower() for a in aliases}:
+                aliases.append(part)
+    return aliases
+
+
+def format_reply_body(target: str, message: str, sender: str, in_reply_to: int) -> str:
+    body = format_send_body(target, message, sender)
+    return f"{body}<!-- reply-to: {int(in_reply_to)} -->\n"
+
+
+def cmd_send(args: argparse.Namespace, cfg: dict[str, str], runner: Callable[..., str]) -> int:
+    sender, key = resolve_sender(args.sender, cfg)
+    url = send_comment(
+        bot=args.bot,
+        message=" ".join(args.message),
+        sender=sender,
+        sign_key=key,
+        repo=cfg["repo"],
+        pr=cfg["pr"],
+        gh=args.gh,
+        runner=runner,
+        forward_for=getattr(args, "forward_for", None),
+        ack_of=getattr(args, "ack_of", None),
+        client_id=getattr(args, "client_id", None),
+    )
+    print(url)
+    return 0
+
+
+def cmd_inbox(args: argparse.Namespace, cfg: dict[str, str], runner: Callable[..., str]) -> int:
+    aliases = parse_aliases(args.for_names)
+    if aliases:
+        return cmd_inbox_for(args, cfg, runner, aliases)
+    if args.mark_read:
+        raise SystemExit("usage_error: --mark-read needs --for <name>")
+    since = parse_iso(args.since) if args.since else None
+    wait_s = args.wait
+    # --wait without --since: id floor = newest comment at the first poll (no wall clock).
+    snapshot = wait_s is not None and since is None
+    after_id: int | None = None
+    deadline = None if wait_s is None else time.monotonic() + max(0, wait_s)
+    failed: list[BaseException] = []
+    while True:
+        comments = wait_poll(args, cfg, runner, deadline, failed)
+        items = []
+        if comments is not None:
+            if snapshot:
+                after_id, snapshot = max_comment_id(comments), False
+            items = inbox_comments(comments, since, after_id=after_id)
+        if items or wait_s is None:
+            json.dump(items, sys.stdout, ensure_ascii=False, indent=2)
+            sys.stdout.write("\n")
+            return 0
+        if wait_timed_out(deadline, failed):
+            json.dump([], sys.stdout)
+            sys.stdout.write("\n")
+            return 0
+        wait_sleep(deadline, len(failed))
+
+
+def cmd_inbox_for(
+    args: argparse.Namespace,
+    cfg: dict[str, str],
+    runner: Callable[..., str],
+    aliases: list[str],
+) -> int:
+    state_dir = Path(os.path.expanduser(args.state_dir)) if args.state_dir else None
+    cursor_file = cursor_path_for_aliases(aliases, state_dir)
+    stored = None if args.all else read_cursor_for_aliases(aliases, state_dir)[0]
+    since = parse_iso(args.since) if args.since else None
+    wait_s = args.wait
+    # Id floor, never the wall clock:
+    # - with a cursor, unread items > cursor come back at once; wait only if none;
+    # - without one (or with --all), --wait takes only ids above the newest comment
+    #   seen on the first poll, so it does not dump old backlog. --mark-read then
+    #   never moves the cursor past an addressed item it hid (see unshown_floor).
+    snapshot = wait_s is not None and since is None and stored is None
+    hid_backlog = snapshot
+    floor = stored
+    deadline = None if wait_s is None else time.monotonic() + max(0, wait_s)
+    keyring = speaker.load_keyring(cfg.get("config_path") or None)
+    legacy_unsigned = speaker.load_legacy_unsigned_wake(cfg.get("config_path") or None)
+    failed: list[BaseException] = []
+
+    while True:
+        comments = wait_poll(args, cfg, runner, deadline, failed)
+        items = []
+        if comments is not None:
+            if snapshot:
+                floor, snapshot = max_comment_id(comments), False
+            items = addressed_inbox(comments, aliases, floor, keyring=keyring)
+            if since is not None:
+                items = [i for i in items if comment_is_newer(i["created_at"], since)]
+        trusted = trusted_inbox(items, keyring=keyring, legacy_unsigned=legacy_unsigned)
+        # --wait ends only on a trusted item, but then shows EVERY addressed item above the
+        # floor (unverified ones marked): --mark-read moves past them, so hiding them here
+        # would drop them silently.
+        shown = items
+        if trusted or wait_s is None:
+            if shown:
+                if args.json:
+                    json.dump(shown, sys.stdout, ensure_ascii=False, indent=2)
+                    sys.stdout.write("\n")
+                else:
+                    sys.stdout.write(format_inbox_text(shown, legacy_unsigned=legacy_unsigned) + "\n")
+            if args.mark_read and trusted:
+                last = max(i["id"] for i in trusted)
+                if hid_backlog:
+                    last = unshown_floor(
+                        trusted_inbox(
+                            addressed_inbox(comments, aliases, None, keyring=keyring),
+                            keyring=keyring,
+                            legacy_unsigned=legacy_unsigned,
+                        ),
+                        trusted,
+                        last,
+                    )
+                write_cursor(cursor_file, last)
+            return 0
+        if wait_timed_out(deadline, failed):
+            if args.json:
+                json.dump([], sys.stdout)
+                sys.stdout.write("\n")
+            return 0
+        wait_sleep(deadline, len(failed))
+
+
+def cmd_roster(args: argparse.Namespace, cfg: dict[str, str], runner: Callable[..., str]) -> int:
+    del runner
+    path = Path(os.path.expanduser(args.config)) if args.config else speaker.default_config_path()
+    names = speaker.load_vip_roster(path)
+    want = getattr(args, "canonical", None)
+    if want:
+        vip = speaker.canonical_vip(want, names)
+        if not vip:
+            return 1
+        print(f"vip: {vip}")
+        return 0
+    for name in names:
+        print(name)
+    return 0
+
+
+def cmd_whoami(args: argparse.Namespace, cfg: dict[str, str], runner: Callable[..., str]) -> int:
+    del runner
+    try:
+        name, _ = speaker.bound_identity(cfg.get("config_path") or None)
+    except speaker.KeyFileError as exc:
+        raise SystemExit(f"identity_error: {exc}") from exc
+    print(name)
+    return 0
+
+
+def cmd_keygen(args: argparse.Namespace, cfg: dict[str, str], runner: Callable[..., str]) -> int:
+    del runner, cfg
+    try:
+        path = speaker.generate_key_file(args.path)
+    except FileExistsError as exc:
+        raise SystemExit(f"key_file_exists: {args.path}") from exc
+    print(json.dumps({"path": str(path), "mode": "0600", "key_material_printed": False}))
+    return 0
+
+
+def cmd_ack(args: argparse.Namespace, cfg: dict[str, str], runner: Callable[..., str]) -> int:
+    """Short ack to the original speaker of COMMENT_ID, with ``<!-- channel-ack: id -->``."""
+    comments = list_issue_comments(cfg["repo"], cfg["pr"], gh=args.gh, runner=runner)
+    original = next((c for c in comments if c.get("id") == args.comment_id), None)
+    if original is None:
+        raise SystemExit(f"not_found: comment {args.comment_id} is not on the channel PR")
+    target = comment_sender(original.get("body") or "")
+    if not target:
+        raise SystemExit("usage_error: cannot tell who sent that comment")
+    message = " ".join(args.message).strip() or "ack"
+    sender, key = resolve_sender(args.sender, cfg)
+    url = send_comment(
+        bot=target,
+        message=message,
+        sender=sender,
+        sign_key=key,
+        repo=cfg["repo"],
+        pr=cfg["pr"],
+        gh=args.gh,
+        runner=runner,
+        ack_of=args.comment_id,
+    )
+    print(url)
+    return 0
+
+
+def cmd_reply(args: argparse.Namespace, cfg: dict[str, str], runner: Callable[..., str]) -> int:
+    comments = list_issue_comments(cfg["repo"], cfg["pr"], gh=args.gh, runner=runner)
+    original = next((c for c in comments if c.get("id") == args.comment_id), None)
+    if original is None:
+        raise SystemExit(f"not_found: comment {args.comment_id} is not on the channel PR")
+    obody = original.get("body") or ""
+    target = (
+        args.to
+        or parse_headers(obody).get("de")
+        or channel_bot_name(obody)
+        or parse_signature(obody)
+    )
+    if not target:
+        raise SystemExit("usage_error: cannot tell who sent that comment; pass --to <Bot>")
+    sender, key = resolve_sender(args.sender, cfg)
+    body = format_reply_body(target, " ".join(args.message), sender, args.comment_id)
+    if key is not None:
+        body = sign_body(body, sender, key)
+    out = runner(["pr", "comment", str(cfg["pr"]), "--repo", cfg["repo"], "--body", body], args.gh)
+    print(out.strip())
+    return 0
+
+
+def _redact_mac(body: str) -> str:
+    content, sig = split_signature(body)
+    if sig is None:
+        return body
+    return content + sig.group(0).replace(sig.group("mac"), "<redacted>") + "\n"
+
+
+def cmd_relay(args: argparse.Namespace, cfg: dict[str, str], runner: Callable[..., str]) -> int:
+    """Post a `<!-- agent-relay -->` for DE. Unsigned unless --sign (opt-in, default off).
+
+    --sign needs this config's `[channel_identity]` bound to the relayer (agent-a); the key
+    comes only from its `key_file` (0600, never argv/env/stdout). The trailer is made at post
+    time (fresh ts + nonce) so presence/inbox verification sees |created_at - ts| <= 600 s.
+    --dry-run prints the body and posts nothing; a signed dry-run redacts the mac so no postable
+    signed body ever leaves this command except through the post itself.
+    """
+    try:
+        body = speaker.format_relay_body(
+            args.de, " ".join(args.message), para=args.para or "", reply_to=args.reply_to
+        )
+    except ValueError as exc:
+        raise SystemExit(f"usage_error: {exc}") from exc
+    if args.sign:
+        try:
+            name, key = speaker.bound_identity(cfg.get("config_path") or None)
+        except speaker.KeyFileError as exc:
+            raise SystemExit(f"identity_error: {exc}") from exc
+        if not name or key is None:
+            raise SystemExit("relay_sign_needs_identity: --sign needs [channel_identity] in --config")
+        if speaker.norm_name(name) != speaker.norm_name(speaker.RELAY_BY):
+            raise SystemExit(
+                f"relay_signer_must_be_relayer: identity is {name!r}, relay signs only as "
+                f"{speaker.RELAY_BY!r}"
+            )
+        body = speaker.sign_relay_body(body, name, key)
+    if args.dry_run:
+        sys.stdout.write(_redact_mac(body) if args.sign else body)
+        return 0
+    out = runner(["pr", "comment", str(cfg["pr"]), "--repo", cfg["repo"], "--body", body], args.gh)
+    print(out.strip())
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="channel-gh",
+        description="Send and read messages on the GitHub PR channel channel.",
+    )
+    parser.add_argument("--config", help="Path to firefly-bridge config.toml")
+    parser.add_argument("--gh", default=os.environ.get("CHANNEL_GH_BIN", "gh"), help="gh executable")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    send = sub.add_parser("send", help="Post a message as a PR comment")
+    send.add_argument("--from", dest="sender", default=None, help="Sender name (or $CHANNEL_FROM)")
+    send.add_argument(
+        "--forward-for",
+        dest="forward_for",
+        default=None,
+        metavar="NAME",
+        help="Non-VIP dest: keep para: agent-a and mark para-original=NAME",
+    )
+    send.add_argument("--ack-of", dest="ack_of", default=None, metavar="ID", help="Mark this send as an ack of comment ID")
+    send.add_argument("--cid", dest="client_id", default=None, metavar="ID", help="Client id marker")
+    send.add_argument("bot", help="Destination bot name (for example agent-a)")
+    send.add_argument("message", nargs="+", help="Message text")
+    send.set_defaults(func=cmd_send)
+
+    inbox = sub.add_parser("inbox", help="List agent-a relay comments")
+    inbox.add_argument("--since", default=None, help="Only comments newer than this ISO-8601 timestamp")
+    inbox.add_argument(
+        "--wait",
+        type=int,
+        default=None,
+        metavar="SECONDS",
+        help="Poll every 20s until a new relay comment arrives or the timeout",
+    )
+    inbox.add_argument(
+        "--for",
+        dest="for_names",
+        action="append",
+        default=None,
+        metavar="NAME[,ALIAS]",
+        help="Only comments addressed to this terminal (para:/to: or relay replies to its messages); text output",
+    )
+    inbox.add_argument(
+        "--mark-read",
+        action="store_true",
+        help="With --for: advance the cursor file so the same comments are not shown again",
+    )
+    inbox.add_argument("--all", action="store_true", help="With --for: ignore the cursor (does not reset it)")
+    inbox.add_argument("--json", action="store_true", help="With --for: print JSON instead of text")
+    inbox.add_argument(
+        "--state-dir",
+        default=None,
+        help="Cursor directory (default $CHANNEL_STATE_DIR or ~/.grok/channel)",
+    )
+    inbox.set_defaults(func=cmd_inbox)
+
+    reply = sub.add_parser("reply", help="Answer a channel comment by id")
+    reply.add_argument("--from", dest="sender", default=None, help="Sender name (or $CHANNEL_FROM)")
+    reply.add_argument("--to", default=None, help="Override the destination name")
+    reply.add_argument("comment_id", type=int, help="Comment id shown by inbox --for (#123...)")
+    reply.add_argument("message", nargs="+", help="Message text")
+    reply.set_defaults(func=cmd_reply)
+
+    relay = sub.add_parser(
+        "relay", help="Post a <!-- agent-relay --> for another speaker (unsigned unless --sign)"
+    )
+    relay.add_argument("--de", required=True, help="Who the relayed message is from (**de:**)")
+    relay.add_argument("--para", default=None, help="Destination (para:)")
+    relay.add_argument("--reply-to", dest="reply_to", type=int, default=None, metavar="ID")
+    relay.add_argument(
+        "--sign",
+        action="store_true",
+        help="Opt-in: sign with channel-sig v=1 as the bound relayer identity (agent-a)",
+    )
+    relay.add_argument("--dry-run", dest="dry_run", action="store_true", help="Print the body, post nothing")
+    relay.add_argument("message", nargs="+", help="Message text")
+    relay.set_defaults(func=cmd_relay)
+
+    roster = sub.add_parser("roster", help="Print VIP roster from config.toml")
+    roster.add_argument(
+        "--canonical",
+        default=None,
+        metavar="NOME",
+        help="Print vip: NAME if NOME is VIP (exit 1 otherwise)",
+    )
+    roster.set_defaults(func=cmd_roster)
+
+    ack = sub.add_parser("ack", help="Short ack to the original speaker of a comment")
+    ack.add_argument("--from", dest="sender", default=None, help="Sender name (or $CHANNEL_FROM)")
+    ack.add_argument("comment_id", type=int, help="Comment id shown by inbox --for")
+    ack.add_argument("message", nargs="*", help="Message text (default: ack)")
+    ack.set_defaults(func=cmd_ack)
+
+    whoami = sub.add_parser("whoami", help="Print the bound [channel_identity] name (empty if unbound)")
+    whoami.set_defaults(func=cmd_whoami)
+    keygen = sub.add_parser("keygen", help="Create a new 0600 HMAC key file (never prints the key)")
+    keygen.add_argument("path")
+    keygen.set_defaults(func=cmd_keygen)
+    return parser
+
+
+def require_config(cfg: dict[str, str]) -> None:
+    if not cfg.get("repo") or not cfg.get("pr"):
+        raise SystemExit(
+            "config_error: set [github_canal] repo and pr in "
+            f"{cfg.get('config_path') or default_config_path()} "
+            "or FIREFLY_BRIDGE_GITHUB_CANAL_REPO / FIREFLY_BRIDGE_GITHUB_CANAL_PR"
+        )
+
+
+def main(argv: list[str] | None = None, runner: Callable[..., str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    cfg_path = Path(os.path.expanduser(args.config)) if args.config else None
+    speaker.use_config(cfg_path)  # roster aliases (`para: agent-d-alt` -> user) come from this config
+    cfg = load_canal_config(cfg_path)
+    if args.cmd not in ("roster", "whoami", "keygen") and not getattr(args, "dry_run", False):
+        require_config(cfg)
+    return int(args.func(args, cfg, runner or run_gh) or 0)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

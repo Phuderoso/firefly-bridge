@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""channel-keygen-smoke: prova offline, com chaves EFÊMERAS num tmpdir apagado ao fim, que
+
+  1. mensagem assinada válida (channel-gh send com identidade) ACORDA (speaker.gate_comment);
+  2. sem assinatura NÃO acorda (legacy_unsigned_wake desligado);
+  3. assinatura inválida/forjada NÃO acorda (corpo adulterado, chave errada, signatário errado,
+     marcador de relay forjado);
+  4. replay de nonce é rejeitado;
+  5. fora da janela de 600 s é rejeitado;
+  6. nenhum stdout/stderr/log/arquivo produzido contém o segredo (hex ou bytes, nem trecho de 16 hex),
+     inclusive com `bash -x` em volta do keygen.
+
+Nada de rede: o `gh` é um falso local (--gh) que guarda os comentários num JSON do tmpdir.
+Nada é escrito fora do tmpdir; HOME/FIREFLY_BRIDGE_CONFIG/CHANNEL_STATE_DIR apontam para ele.
+Saída: uma linha JSON por verificação + resumo; exit 0 só se tudo passou e o tmpdir sumiu.
+"""
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+REPO = HERE.parent
+KEYGEN = HERE / "channel-keygen"
+TG = HERE / "channel-gh"
+sys.path.insert(0, str(REPO))
+from firefly_bridge import speaker as sp  # noqa: E402
+
+FAKE_GH = r'''#!/usr/bin/env python3
+import json, os, sys
+from datetime import datetime, timezone
+store = os.environ["SMOKE_GH_STORE"]
+data = json.load(open(store)) if os.path.exists(store) else []
+a = sys.argv[1:]
+if a[:2] == ["pr", "comment"]:
+    body = a[a.index("--body") + 1]
+    cid = len(data) + 1
+    data.append({"id": cid, "body": body, "user": {"login": "owner-account"},
+                 "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
+    tmp = store + ".tmp"
+    json.dump(data, open(tmp, "w")); os.replace(tmp, store)
+    print("https://example.invalid/pull/1#issuecomment-%d" % cid)
+elif a[:1] == ["api"]:
+    print(json.dumps(data))
+else:
+    sys.exit("fake gh: unsupported %r" % a[:2])
+'''
+
+BASE = '''[github_canal]
+repo = "ExampleOwner/example-canal"
+pr = "1"
+
+[channel_roster]
+vip = ["agent-a", "peerb", "agent-c", "owner"]
+owner = "owner"
+pending = ["peerb", "peera"]
+
+[channel_roster.aliases]
+owner = ["ownernick"]
+
+[channel_wake]
+legacy_unsigned_wake = false
+'''
+
+
+class Smoke:
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.outputs: list[str] = []  # every byte any step printed, scanned at the end
+        self.results: list[dict] = []
+        self.env = dict(os.environ, HOME=str(root / "home"), FIREFLY_BRIDGE_CONFIG=str(root / "none.toml"),
+                        CHANNEL_STATE_DIR=str(root / "state"), SMOKE_GH_STORE=str(root / "pr.json"),
+                        PYTHONDONTWRITEBYTECODE="1")
+        self.env.pop("CHANNEL_FROM", None)
+
+    def run(self, argv: list[str], *, ok: bool = True, env: dict | None = None) -> subprocess.CompletedProcess:
+        p = subprocess.run(argv, capture_output=True, text=True, env=env or self.env, timeout=60)
+        self.outputs += [p.stdout, p.stderr]
+        if ok and p.returncode != 0:
+            raise RuntimeError(f"falhou ({p.returncode}): {argv[1:3]} :: {p.stderr.strip()[:300]}")
+        return p
+
+    def check(self, name: str, cond: bool, **info) -> None:
+        self.results.append({"check": name, "ok": bool(cond), **info})
+
+
+def secret_leaks(text: str, secrets_hex: list[str]) -> list[str]:
+    low = text.lower()
+    hits = []
+    for h in secrets_hex:
+        windows = {h[i:i + 16] for i in range(0, len(h) - 15)}
+        if h in low or any(w in low for w in windows):
+            hits.append(h[:0] + "<segredo>")  # never echo what matched
+    return hits
+
+
+def main() -> int:
+    os.umask(0o077)
+    root = Path(tempfile.mkdtemp(prefix="channel-smoke-"))
+    s = Smoke(root)
+    py = sys.executable
+    try:
+        keyring = root / "keyring"
+        gh = root / "fake-gh"
+        gh.write_text(FAKE_GH, encoding="utf-8")
+        gh.chmod(0o700)
+        (root / "base.toml").write_text(BASE, encoding="utf-8")
+
+        # keygen (sob bash -x: o segredo nunca está em argv/env, então o xtrace não tem o que vazar)
+        base_cfg = root / "base.toml"
+        # fase 1: owner nunca, peerb só com a flag explícita — recusa antes de qualquer escrita
+        own = s.run([py, str(KEYGEN), "gen", "--keyring", str(keyring), "--config", str(base_cfg),
+                     "ownernick", "--allow-pending-identity"], ok=False)
+        s.check("keygen_recusa_owner_mesmo_com_flag", own.returncode == 4
+                and "identidade_do_owner_recusada" in own.stderr and not keyring.exists())
+        pend = s.run([py, str(KEYGEN), "gen", "--keyring", str(keyring), "--config", str(base_cfg), "peera"], ok=False)
+        s.check("keygen_recusa_peerb_sem_flag", pend.returncode == 4
+                and "identidade_pendente_recusada" in pend.stderr and not keyring.exists())
+        xt = s.run(["bash", "-xc", f'"{py}" "{KEYGEN}" gen --keyring "{keyring}" --config "{base_cfg}" '
+                                   'agent-a peerb agent-c --allow-pending-identity'])  # efêmeras: peerb só aqui, com flag
+        s.check("keygen_sob_bash_x", xt.stderr.startswith("+ ") and "fingerprint" in xt.stdout)
+        modes = {f.name: oct(f.stat().st_mode & 0o777) for f in keyring.glob("*.key")}
+        s.check("keygen_modos_0600", modes and all(m == "0o600" for m in modes.values()), modes=modes)
+        s.check("keyring_0700", oct(keyring.stat().st_mode & 0o777) == "0o700")
+        again = s.run([py, str(KEYGEN), "gen", "--keyring", str(keyring), "--config", str(base_cfg),
+                       "peerb", "--allow-pending-identity"], ok=False)
+        s.check("keygen_recusa_sobrescrever", again.returncode == 3)
+        for name in ("agent-a", "peerb", "agent-c"):
+            s.run([py, str(KEYGEN), "render-config", "--base", str(root / "base.toml"), "--name", name,
+                   "--keyring", str(keyring), "--out", str(root / f"{name.lower()}.toml"),
+                   "--allow-pending-identity"])  # efêmeras: a identidade pendente só existe aqui
+        chk = s.run([py, str(KEYGEN), "check", "--keyring", str(keyring), "--config", str(root / "peerb.toml"),
+                     "--allow-pending-identity"], ok=False)
+        s.check("keygen_check_ok", chk.returncode == 0)
+        s.check("legacy_desligado", sp.load_legacy_unsigned_wake(root / "peerb.toml") is False)
+
+        def send(cfg: str, *args: str, ok: bool = True) -> subprocess.CompletedProcess:
+            return s.run([py, str(TG), "--config", str(root / cfg), "--gh", str(gh), "send", *args], ok=ok)
+
+        send("agent-a.toml", "peerb", "acorda, smoke assinado")           # 1: assinado válido
+        send("base.toml", "--from", "agent-a", "peerb", "sem assinatura")   # 2: sem identidade => sem trailer
+        send("agent-c.toml", "peerb", "assinado pela agent-c")                     # 3: VIP assinado (controle)
+        spoof = send("agent-c.toml", "--from", "agent-a", "peerb", "spoof", ok=False)
+        s.check("send_recusa_from_diferente_da_identidade", spoof.returncode != 0 and "sender_mismatch" in spoof.stderr)
+
+        store = root / "pr.json"
+        comments = json.loads(store.read_text(encoding="utf-8"))
+        signed, unsigned = comments[0], comments[1]
+        s.check("assinado_tem_trailer", sp.split_signature(signed["body"])[1] is not None)
+        s.check("sem_identidade_sem_trailer", sp.split_signature(unsigned["body"])[1] is None)
+
+        now = datetime.now(timezone.utc)  # noqa: UP017 - py3.9 (macOS /usr/bin/python3)
+        iso = lambda dt: dt.strftime("%Y-%m-%dT%H:%M:%SZ")  # noqa: E731
+        trailer = sp.split_signature(signed["body"])[1]
+        ts = int(trailer.group("ts"))
+        attacker = sp.generate_key_file(root / "attacker" / "agent.key")  # chave fora do keyring
+        extra = [
+            {"id": 10, "case": "corpo_adulterado", "created_at": signed["created_at"],
+             "body": signed["body"].replace("smoke assinado", "smoke ADULTERADO")},
+            {"id": 11, "case": "chave_errada", "created_at": signed["created_at"],
+             "body": sp.sign_body("para: peerb\n\nforjada\n\n— agent-a\n", "agent-a", sp.load_key(attacker), ts=ts)},
+            {"id": 12, "case": "signatario_errado", "created_at": iso(now),  # MAC válido da agent-c, corpo diz agent-a
+             "body": sp.sign_body("para: peerb\n\nsou a agent-a (mentira)\n\n— agent-a\n", "agent-c",
+                                  sp.load_key(keyring / "agent-c.key"), ts=int(now.timestamp()))},
+            {"id": 13, "case": "relay_forjado_sem_assinatura", "created_at": iso(now),
+             "body": "<!-- agent-relay -->\nde: guest\npara: peerb\n\nrelay forjado\n"},
+            {"id": 14, "case": "replay_de_nonce", "created_at": signed["created_at"], "body": signed["body"]},
+            {"id": 15, "case": "fora_da_janela_600s",
+             "created_at": iso(datetime.fromtimestamp(ts + 601, timezone.utc)),  # noqa: UP017
+             "body": signed["body"]},
+        ]
+        # replay/janela precisam de um corpo cujo nonce só apareceu neste comentário
+        extra[5]["body"] = sp.sign_body(sp.split_signature(signed["body"])[0], "agent-a",
+                                        sp.load_key(keyring / "agent-a.key"), ts=ts)
+        allc = comments + [{k: v for k, v in c.items() if k != "case"} for c in extra]
+
+        cfg = root / "peerb.toml"
+        sp.use_config(cfg)
+        roster = sp.load_vip_roster(cfg)
+        ring = sp.load_keyring(cfg)
+        seen: dict = {}
+        verdicts = {}
+        for c in sorted(allc, key=lambda c: c["id"]):
+            chk_ = sp.verify_comment(c, ring, seen)
+            d = sp.gate_comment(c, own_aliases=["peerb"], roster=roster, keyring=ring, seen_nonces=seen)
+            verdicts[c["id"]] = (d.action, d.reason, chk_.auth)
+        s.check("assinado_valido_acorda", verdicts[1][0] == "wake", verdict=verdicts[1])
+        s.check("vip_assinado_acorda", verdicts[3][0] == "wake", verdict=verdicts[3])
+        s.check("sem_assinatura_nao_acorda", verdicts[2][0] != "wake" and verdicts[2][1] == "signature_required",
+                verdict=verdicts[2])
+        names = {10: "corpo_adulterado", 11: "chave_errada", 12: "signatario_errado", 13: "relay_forjado_sem_assinatura"}
+        for cid, nm in names.items():
+            s.check(f"forjado_{nm}_nao_acorda", verdicts[cid][0] != "wake", verdict=verdicts[cid])
+        s.check("replay_de_nonce_rejeitado", verdicts[14][0] != "wake" and verdicts[14][2] == "replayed_nonce",
+                verdict=verdicts[14])
+        s.check("fora_da_janela_600s_rejeitado", verdicts[15][0] != "wake" and verdicts[15][2] == "stale",
+                verdict=verdicts[15])
+
+        # leitura continua funcionando: inbox --for mostra tudo, marcando o não verificado
+        inbox = s.run([py, str(TG), "--config", str(cfg), "--gh", str(gh), "inbox", "--for", "peerb",
+                       "--state-dir", str(root / "state")])
+        s.check("inbox_entrega_e_marca_nao_verificado",
+                "smoke assinado" in inbox.stdout and "(não verificado: unsigned)" in inbox.stdout)
+        who = s.run([py, str(TG), "--config", str(root / "agent-a.toml"), "whoami"])
+        s.check("whoami", who.stdout.strip() == "agent-a")
+        s.run([py, str(KEYGEN), "fingerprint", "--keyring", str(keyring)])
+
+        # 6. nenhum segredo em nada que foi produzido (fora os próprios .key)
+        secrets_hex = [f.read_text(encoding="ascii").strip().lower() for f in keyring.glob("*.key")]
+        secrets_hex.append(attacker.read_text(encoding="ascii").strip().lower())
+        report_preview = json.dumps(s.results, ensure_ascii=False)
+        files = [p for p in root.rglob("*") if p.is_file() and p.suffix != ".key"]
+        blob = "\n".join(s.outputs + [report_preview] + [p.read_text(encoding="utf-8", errors="replace") for p in files])
+        raw_hits = any(bytes.fromhex(h) in p.read_bytes() for h in secrets_hex for p in files)
+        s.check("nenhum_output_ou_arquivo_contem_segredo", not secret_leaks(blob, secrets_hex) and not raw_hits,
+                scanned_files=len(files), scanned_outputs=len(s.outputs))
+        del secrets_hex, blob
+    except Exception as exc:  # noqa: BLE001 - report, never print locals
+        s.check("execucao", False, error=f"{type(exc).__name__}: {str(exc)[:300]}")
+    finally:
+        sp.use_config(None)
+        shutil.rmtree(root, ignore_errors=True)
+    s.check("tmpdir_apagado", not root.exists())
+    for r in s.results:
+        print(json.dumps(r, ensure_ascii=False))
+    ok = all(r["ok"] for r in s.results)
+    print(json.dumps({"smoke": "ok" if ok else "FALHOU", "checks": len(s.results),
+                      "failed": [r["check"] for r in s.results if not r["ok"]]}, ensure_ascii=False))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

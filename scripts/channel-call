@@ -1,0 +1,42 @@
+#!/bin/bash
+# channel-call — one-word send on the GitHub comment channel (receive half is knock).
+# Usage:  channel-call <Bot> "message..."
+#         channel-call --from peerb agent-a "..."
+# VIP dest: `channel-gh roster` (config.toml). Non-VIP wrap as:
+#   channel-gh send --from "$FROM" agent-a --forward-for "$BOT" "..."
+# The relay principal is direct even when the roster is empty.
+# CHANNEL_SENDERS is a comma list of identities allowed to send (default peerb,peera).
+TG="${CHANNEL_GH:-channel-gh}"
+FROM="${CHANNEL_FROM:-peerb}"
+RELAY="${CHANNEL_RELAY:-agent-a}"
+ALLOWED="${CHANNEL_SENDERS:-peerb,peera}"
+VIP=$("$TG" roster 2>/dev/null | tr '\n' ' ')
+VIP="${VIP% }"
+if [ $# -lt 2 ]; then
+  echo "usage: channel-call <Bot> \"message\"   (VIP direct: $VIP)"
+  echo "non-VIP names go through the relay: channel-call guest \"...\""
+  exit 2
+fi
+while [ "$1" = "--from" ] && [ $# -ge 3 ]; do FROM="$2"; shift 2; done
+[ "$1" = "send" ] && [ $# -ge 3 ] && shift
+while [ "$1" = "--from" ] && [ $# -ge 3 ]; do FROM="$2"; shift 2; done
+BOT="$1"; shift
+WRAP=""
+CANON=$("$TG" roster --canonical="$BOT" 2>/dev/null | sed -n 's/^vip: \([A-Za-z0-9_.-]\{1,64\}\)$/\1/p' | head -n 1)
+if [ -n "$CANON" ]; then
+  BOT="$CANON"
+elif [ "$(printf '%s' "$BOT" | tr '[:upper:]' '[:lower:]')" = "$(printf '%s' "$RELAY" | tr '[:upper:]' '[:lower:]')" ]; then
+  BOT="$RELAY"
+else
+  WRAP="$BOT"
+  BOT="$RELAY"
+fi
+case ",$ALLOWED," in
+  *,"$FROM",*) ;;
+  *) echo "channel-call: CHANNEL_FROM/$FROM is not in CHANNEL_SENDERS" >&2; exit 4 ;;
+esac
+if [ -n "${WRAP:-}" ]; then
+  echo "channel-call: via $RELAY → $WRAP" >&2
+  exec "$TG" send --from "$FROM" "$RELAY" --forward-for "$WRAP" "$@"
+fi
+exec "$TG" send --from "$FROM" "$BOT" "$@"

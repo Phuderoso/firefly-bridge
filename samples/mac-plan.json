@@ -1,0 +1,32 @@
+{
+  "commands_in_order": [
+    "grok version",
+    "grok leader list --help",
+    "grok leader list --json",
+    "grok sessions list --limit 50"
+  ],
+  "executed_on_this_machine": false,
+  "how_to_read_results": "leader_count is only the length of a JSON list from grok leader list --json, and only after that command's own --help prints --json. The vendor CLI reference retrieved with these docs does not document the subcommand. An empty list means this output discovered no leader. It does not mean attachment is impossible, and a non-empty list does not mean a prompt may be sent. pinned_session_id_seen is a boolean substring check. Summaries are discarded. Neither observation makes disk load into live attachment, and neither proves the turn is idle.",
+  "live_send_allowed": false,
+  "user_env": {
+    "AGENT_SESSION_CWD": "Absolute workspace directory of that session. Refused when a path segment is .grok. If unset or unsafe, session presence stays unknown.",
+    "PINNED_SESSION_ID": "Exact session id. If unset, sessions list is skipped."
+  },
+  "requires_both": [
+    "AGENT_PREFLIGHT_EXECUTE=1",
+    "--execute"
+  ],
+  "skipped": [
+    "grok agent stdio",
+    "grok -p",
+    "grok --resume",
+    "grok --continue",
+    "grok sessions search",
+    "grok sessions delete",
+    "grok leader kill",
+    "grok usage",
+    "any read of ~/.grok/sessions or auth files"
+  ],
+  "when_a_coordinated_restart_would_be_required": "If a future design needs peerb restarted, use_leader flipped, or a new agent process, that is a coordinated change. This preflight does not do it, and a restart would still not supply the missing semantics.",
+  "when_a_live_test_could_proceed": "Only after a vendor document states all of: a second client attaches to the same running in-memory session; a prompt is queued behind an active human turn and cannot steer or cancel it; the TUI draft buffer is left untouched; and a speaker identity other than the user prompt exists. A new build would still have to enable the transport. Leader presence and a visible session id are not sufficient."
+}

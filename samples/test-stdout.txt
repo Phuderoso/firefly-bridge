@@ -1,0 +1,38 @@
+test_cli_exits (test_bridge.CliTests.test_cli_exits) ... ok
+test_cli_reopen_same_id_does_not_resend (test_bridge.CliTests.test_cli_reopen_same_id_does_not_resend) ... ok
+test_conflicting_id_content_does_not_exchange (test_bridge.LedgerTests.test_conflicting_id_content_does_not_exchange) ... ok
+test_corrupt_ledger_does_not_send (test_bridge.LedgerTests.test_corrupt_ledger_does_not_send) ... ok
+test_outbound_attribution_and_json_framing (test_bridge.LedgerTests.test_outbound_attribution_and_json_framing) ... ok
+test_prepared_survives_restart_and_sends_once (test_bridge.LedgerTests.test_prepared_survives_restart_and_sends_once) ... ok
+test_reopen_does_not_exchange_again (test_bridge.LedgerTests.test_reopen_does_not_exchange_again) ... ok
+test_unknown_is_durable_before_exchange (test_bridge.LedgerTests.test_unknown_is_durable_before_exchange) ... ok
+test_allow_only_permission_is_cancelled (test_bridge.PolicyTests.test_allow_only_permission_is_cancelled) ... ok
+test_busy_before_write_and_unknown_busy (test_bridge.PolicyTests.test_busy_before_write_and_unknown_busy) ... ok
+test_correlated_mock_round_trip (test_bridge.PolicyTests.test_correlated_mock_round_trip) ... ok
+test_correlation_mismatch_is_unknown (test_bridge.PolicyTests.test_correlation_mismatch_is_unknown) ... ok
+test_duplicate_message_id (test_bridge.PolicyTests.test_duplicate_message_id) ... ok
+test_forbidden_method_does_not_load_or_create (test_bridge.PolicyTests.test_forbidden_method_does_not_load_or_create) ... ok
+test_hanging_transport_hits_deadline_without_cancel (test_bridge.PolicyTests.test_hanging_transport_hits_deadline_without_cancel) ... ok
+test_live_transport_writes_nothing (test_bridge.PolicyTests.test_live_transport_writes_nothing) ... ok
+test_missing_and_unpinned_session_never_writes (test_bridge.PolicyTests.test_missing_and_unpinned_session_never_writes) ... ok
+test_no_create_across_scripts (test_bridge.PolicyTests.test_no_create_across_scripts) ... ok
+test_permission_deny_does_not_escalate (test_bridge.PolicyTests.test_permission_deny_does_not_escalate) ... ok
+test_prompt_builder_rejects_setup_fields (test_bridge.PolicyTests.test_prompt_builder_rejects_setup_fields) ... ok
+test_source_must_match_sender (test_bridge.PolicyTests.test_source_must_match_sender) ... ok
+test_timeout_bounds_rejected (test_bridge.PolicyTests.test_timeout_bounds_rejected) ... ok
+test_timeout_crash_malformed_are_unknown_and_not_resent (test_bridge.PolicyTests.test_timeout_crash_malformed_are_unknown_and_not_resent) ... ok
+test_wrong_session_does_not_create (test_bridge.PolicyTests.test_wrong_session_does_not_create) ... ok
+test_allowlist_rejects_mutating_argv_before_spawn (test_bridge.PreflightTests.test_allowlist_rejects_mutating_argv_before_spawn) ... ok
+test_contract_blocks_live_send (test_bridge.PreflightTests.test_contract_blocks_live_send) ... ok
+test_empty_leader_list_is_not_impossibility (test_bridge.PreflightTests.test_empty_leader_list_is_not_impossibility) ... ok
+test_execute_against_fake_grok_redacts (test_bridge.PreflightTests.test_execute_against_fake_grok_redacts) ... ok
+test_execute_requires_env_flag (test_bridge.PreflightTests.test_execute_requires_env_flag) ... ok
+test_fixture_cannot_force_the_gate_open (test_bridge.PreflightTests.test_fixture_cannot_force_the_gate_open) ... ok
+test_grok_dir_cwd_is_refused (test_bridge.PreflightTests.test_grok_dir_cwd_is_refused) ... ok
+test_help_without_json_does_not_list_leaders (test_bridge.PreflightTests.test_help_without_json_does_not_list_leaders) ... ok
+test_missing_binary (test_bridge.PreflightTests.test_missing_binary) ... ok
+
+----------------------------------------------------------------------
+Ran 33 tests in 0.538s
+
+OK

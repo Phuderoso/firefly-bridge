@@ -1,0 +1,150 @@
+{
+  "blockers": [
+    {
+      "detail": "No retrieved page states that an additional ACP client attaches to the in-memory session already open in the interactive TUI. session/load and grok --resume load persisted history (updates.jsonl / ~/.grok/sessions). That is a copy or a restore, not live attachment.",
+      "id": "attach",
+      "status": "missing"
+    },
+    {
+      "detail": "No retrieved page documents a busy query or a queue that waits behind a human turn without steering it. session/cancel is specified as abort. The v2 draft, which Grok has not published as its version, explicitly allows a prompt during active work to steer the turn. Busy cannot be inferred. Non-interruption is not guaranteed.",
+      "id": "noninterruption",
+      "status": "missing"
+    },
+    {
+      "detail": "No retrieved page mentions the TUI draft line. Nothing establishes that a programmatic prompt leaves partially typed text untouched.",
+      "id": "composer",
+      "status": "missing"
+    },
+    {
+      "detail": "session/prompt is a user message. No documented field marks the sender as agent-a rather than the user. Attribution in this prototype stays on the local receipt.",
+      "id": "speaker",
+      "status": "missing"
+    },
+    {
+      "detail": "Grok's headless page says session/prompt returns completion metadata at the end of the turn. There is no documented intermediate transport-accepted frame. The mock ack agent.mock/accepted is synthetic and is rejected as a reason to enable the live transport.",
+      "id": "acceptance_ack",
+      "status": "missing"
+    },
+    {
+      "detail": "--leader means connect to a shared leader process. The model-config snoop shows the proxy can see more than one client's model default. It does not name the RPC that selects the TUI's current session, and the docs.x.ai CLI reference does not document grok leader list. A previous empty leader list proved nothing was discovered then; it is not current availability and not impossibility.",
+      "id": "leader_semantics",
+      "status": "incomplete"
+    }
+  ],
+  "busy_query_documented": false,
+  "citations": [
+    {
+      "anchor": "published page, no git SHA; retrieved 2026-11-08",
+      "id": "docs-headless",
+      "url": "https://docs.x.ai/build/cli/headless-scripting"
+    },
+    {
+      "anchor": "published page, no git SHA; retrieved 2026-11-08",
+      "id": "docs-sessions",
+      "url": "https://docs.x.ai/build/features/sessions"
+    },
+    {
+      "anchor": "published page, no git SHA; retrieved 2026-11-08",
+      "id": "docs-cli-ref",
+      "url": "https://docs.x.ai/build/cli/reference"
+    },
+    {
+      "anchor": "published page, no git SHA; retrieved 2026-11-08",
+      "id": "docs-mcp",
+      "url": "https://docs.x.ai/build/features/mcp-servers"
+    },
+    {
+      "anchor": "published page, no git SHA; retrieved 2026-11-08",
+      "id": "docs-hooks",
+      "url": "https://docs.x.ai/build/features/hooks"
+    },
+    {
+      "anchor": "blob c025513e2821768e826ccdaec7eb77bb806a3337; last commit touching the path 72a61251fcffb464bcc687aeb5a998e5a98ec0c9 (2026-09-01, source revision a549186d9d39311f2d3ee4208db62af8c65aa476); contents API ref=main retrieved 2026-11-08",
+      "id": "guide-agent",
+      "url": "https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/docs/user-guide/15-agent-mode.md"
+    },
+    {
+      "anchor": "blob 93b190805b0c2f0dfad58f130799348e33ae1b1b; contents API ref=main retrieved 2026-11-08",
+      "id": "guide-sessions",
+      "url": "https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/docs/user-guide/17-sessions.md"
+    },
+    {
+      "anchor": "blob 8fea7538fc7d1dee1cfb70df9ccbc18dcd70635e; contents API ref=main retrieved 2026-11-08",
+      "id": "shell-readme",
+      "url": "https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-shell/README.md"
+    },
+    {
+      "anchor": "published page; retrieved 2026-11-08",
+      "id": "acp-v1-load",
+      "url": "https://agentclientprotocol.com/protocol/v1/session-setup"
+    },
+    {
+      "anchor": "published page; retrieved 2026-11-08",
+      "id": "acp-prompt",
+      "url": "https://agentclientprotocol.com/protocol/prompt-turn"
+    },
+    {
+      "anchor": "published page; retrieved 2026-11-08",
+      "id": "acp-v1-permission",
+      "url": "https://agentclientprotocol.com/protocol/v1/tool-calls"
+    },
+    {
+      "anchor": "draft page; retrieved 2026-11-08; not Grok's published protocolVersion",
+      "id": "acp-v2-draft-prompt",
+      "url": "https://agentclientprotocol.com/protocol/v2/prompt-lifecycle"
+    }
+  ],
+  "composer_preservation_documented": false,
+  "disk_load_is_live_attachment": false,
+  "agent_speaker_documented": false,
+  "gates": [
+    {
+      "detail": "Vendor text does not say a second client joins the running TUI session.",
+      "id": "contract_attach",
+      "pass": false
+    },
+    {
+      "detail": "No documented busy query or non-steering queue. Do not send.",
+      "id": "noninterruption",
+      "pass": false
+    },
+    {
+      "detail": "Draft-buffer preservation is not documented.",
+      "id": "composer",
+      "pass": false
+    },
+    {
+      "detail": "agent-a is not a documented ACP speaker. Receipt attribution only.",
+      "id": "speaker",
+      "pass": false
+    },
+    {
+      "detail": "The documented existing-session ACP method is session/load, which replays history.",
+      "id": "not_disk_load",
+      "pass": false
+    },
+    {
+      "detail": "leader_availability_unknown. grok leader list is not in the retrieved CLI reference. The list command runs only when its own --help prints --json.",
+      "id": "leader_observed",
+      "informational": true,
+      "pass": false
+    },
+    {
+      "detail": "session_presence_unknown. Missing from this list is not absence. The list is per working directory.",
+      "id": "session_pinned_seen",
+      "informational": true,
+      "pass": false
+    },
+    {
+      "detail": "This preflight does not restart peerb or edit config. A restart would be a separate coordinated change and still would not open the send gate.",
+      "id": "no_restart",
+      "pass": true
+    }
+  ],
+  "live_send_allowed": false,
+  "live_transport": "disabled",
+  "next_step": "Notify the user. Do not send. Optional next action is the read-only Mac preflight. It cannot open this gate.",
+  "noninterruption_guaranteed": false,
+  "retrieved": "2026-11-08",
+  "send_authorized_by_passing_gates": false
+}

@@ -1,0 +1,531 @@
+#!/usr/bin/env python3
+"""channel-keygen: chaves HMAC do canal channel (channel-sig v=1), no formato que
+firefly_bridge.speaker lê (load_key / load_keyring_dir / bound_identity).
+
+Formato (conferido em speaker.py):
+  * um arquivo por identidade: <keyring>/<nome em minúsculas>.key
+  * conteúdo: 64 hex (32 bytes de secrets.token_bytes) + "\\n"
+  * arquivo regular, dono = usuário atual, modo 0600; diretório 0700
+  * load_keyring_dir indexa por norm_name(stem) (aliases do roster valem).
+
+Política de identidades (uma função, refuse_blocked_identities, usada por gen, render-config
+e check; tudo é recusado antes da primeira escrita):
+  * owner = piso fixo {owner, ownernick} + [channel_roster] owner + aliases, sem diferenciar
+    maiúsculas: sempre recusado, nenhuma flag libera. Na fase 1 o dono fala por relay
+    assinado pela agent-a.
+  * identidade pendente (peerb, peera, peera-peerb + aliases do roster): recusada sem
+    --allow-pending-identity, que só a própria identidade usa ao entrar.
+  * o roster vem de --config, senão $FIREFLY_BRIDGE_CONFIG, senão
+    ~/.config/firefly-bridge/config.toml. Sem config, ou config sem owner, o gen recusa:
+    sem roster não há como saber quem é o dono (falha fechada).
+
+O SEGREDO NUNCA É IMPRESSO: stdout/stderr só mostram nome, caminho, modo e uma impressão
+digital (sha256 com separação de domínio, truncada em 16 hex). Sem rede, stdlib só.
+
+  channel-keygen gen --keyring DIR NOME [NOME ...] [--force] [--config CFG] [--allow-pending-identity]
+  channel-keygen fingerprint --keyring DIR [NOME ...]
+  channel-keygen check --keyring DIR [--config CONFIG] [--allow-pending-identity]
+  channel-keygen render-config --base CONFIG --name NOME --keyring DIR --out SAIDA [--force]
+                                 [--allow-pending-identity]
+  channel-keygen revoke --keyring DIR NOME --yes
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import secrets
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+KEY_BYTES = 32
+FP_DOMAIN = b"channel-key-fingerprint/v1\n"
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")  # also satisfies sign_body's [^\s<>]+
+EXIT_OK, EXIT_USAGE, EXIT_EXISTS, EXIT_UNSAFE = 0, 2, 3, 4
+
+
+class KeygenError(RuntimeError):
+    def __init__(self, code: int, msg: str) -> None:
+        super().__init__(msg)
+        self.code = code
+
+
+def _expand(p: str | Path) -> Path:
+    return Path(os.path.expanduser(os.path.expandvars(str(p))))
+
+
+def key_path(keyring: Path, name: str) -> Path:
+    if not NAME_RE.match(name or ""):
+        raise KeygenError(EXIT_USAGE, f"nome_invalido: {name!r} (use [A-Za-z0-9._-], sem espaço)")
+    return keyring / f"{name.lower()}.key"
+
+
+def fingerprint(key: bytes) -> str:
+    """Public, non-reversible id of a key: sha256(domain || key)[:16]. Safe to log and compare."""
+    return hashlib.sha256(FP_DOMAIN + key).hexdigest()[:16]
+
+
+def _mode(p: Path) -> str:
+    return oct(stat.S_IMODE(p.lstat().st_mode))[2:].zfill(4)
+
+
+def _fsync_dir(d: Path) -> None:
+    try:
+        fd = os.open(d, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def ensure_keyring_dir(keyring: Path) -> None:
+    keyring.mkdir(parents=True, exist_ok=True, mode=0o700)
+    st = keyring.lstat()
+    if not stat.S_ISDIR(st.st_mode):
+        raise KeygenError(EXIT_UNSAFE, f"keyring_nao_e_diretorio: {keyring}")
+    if hasattr(os, "getuid") and st.st_uid != os.getuid():
+        raise KeygenError(EXIT_UNSAFE, f"keyring_dono_errado: {keyring}")
+    if st.st_mode & 0o077:
+        os.chmod(keyring, 0o700)
+
+
+def read_key(path: Path) -> bytes:
+    """Same rules as speaker.load_key (regular file, ours, 0600-or-stricter, hex >= 32 bytes)."""
+    try:
+        st = path.lstat()
+    except OSError as exc:
+        raise KeygenError(EXIT_UNSAFE, f"chave_ausente: {path}") from exc
+    if not stat.S_ISREG(st.st_mode):
+        raise KeygenError(EXIT_UNSAFE, f"chave_nao_regular (symlink?): {path}")
+    if st.st_mode & 0o077:
+        raise KeygenError(EXIT_UNSAFE, f"chave_permissao_aberta: {path} modo {_mode(path)} (exige 0600)")
+    if hasattr(os, "getuid") and st.st_uid != os.getuid():
+        raise KeygenError(EXIT_UNSAFE, f"chave_dono_errado: {path}")
+    try:
+        key = bytes.fromhex(path.read_text(encoding="ascii").strip())
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise KeygenError(EXIT_UNSAFE, f"chave_nao_hex: {path}") from exc  # never echo content
+    if len(key) < KEY_BYTES:
+        raise KeygenError(EXIT_UNSAFE, f"chave_curta: {path}")
+    return key
+
+
+def write_key_atomic(target: Path, key: bytes, *, force: bool) -> None:
+    """tmp O_EXCL 0600 in the same dir -> fsync -> link (no clobber) or replace (--force)."""
+    tmp = target.with_name(f".{target.name}.{secrets.token_hex(8)}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        try:
+            os.write(fd, (key.hex() + "\n").encode("ascii"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        if force:
+            os.replace(tmp, target)
+        else:
+            try:
+                os.link(tmp, target)  # atomic, fails if target exists: never overwrites
+            except FileExistsError as exc:
+                raise KeygenError(EXIT_EXISTS, f"chave_existe: {target} (use --force para rotacionar)") from exc
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+    _fsync_dir(target.parent)
+
+
+def inside_git_worktree(p: Path) -> str:
+    """Toplevel of a git worktree containing p ("" if none / git missing)."""
+    probe = p if p.is_dir() else p.parent
+    while not probe.exists():
+        probe = probe.parent
+    try:
+        r = subprocess.run(["git", "-C", str(probe), "rev-parse", "--show-toplevel"],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def _refuse_git(keyring: Path, allow: bool) -> None:
+    top = inside_git_worktree(keyring)
+    if top and not allow:
+        raise KeygenError(EXIT_UNSAFE, f"keyring_dentro_de_repo_git: {keyring} está em {top}; "
+                                       "chaves nunca vivem num worktree (use ~/.config/channel/keyring)")
+
+
+def cmd_gen(a) -> list[dict]:
+    # Everything that can refuse runs before the first write (not even the keyring dir is created).
+    keyring = _expand(a.keyring)
+    targets = [key_path(keyring, n) for n in a.names]  # NAME_RE
+    try:
+        refuse_blocked_identities(a.names, load_roster_config(a.config)[0], a.allow_pending_identity)
+    except KeygenError as exc:
+        raise KeygenError(exc.code, f"{exc} Nada foi escrito.") from None
+    _refuse_git(keyring, a.allow_git_worktree)
+    ensure_keyring_dir(keyring)
+    if len({t.name for t in targets}) != len(targets):
+        raise KeygenError(EXIT_USAGE, "nomes_repetidos (comparação sem maiúsculas)")
+    if not a.force:
+        clash = [str(t) for t in targets if t.exists() or t.is_symlink()]
+        if clash:
+            raise KeygenError(EXIT_EXISTS, "chave_existe: " + ", ".join(clash) + " (nada foi escrito; --force rotaciona)")
+    out = []
+    for i, t in enumerate(targets):
+        name = a.names[i]
+        if t.is_symlink():
+            raise KeygenError(EXIT_UNSAFE, f"chave_e_symlink: {t}")
+        old = None
+        if a.force and t.exists():
+            try:
+                old = fingerprint(read_key(t))
+            except KeygenError:
+                old = "ilegivel"
+        key = secrets.token_bytes(KEY_BYTES)
+        write_key_atomic(t, key, force=a.force)
+        rec = {"name": name, "path": str(t), "mode": _mode(t), "fingerprint": fingerprint(key),
+               "key_material_printed": False}
+        if old:
+            rec["replaced_fingerprint"] = old
+        out.append(rec)
+        del key
+    return out
+
+
+def cmd_fingerprint(a) -> list[dict]:
+    keyring = _expand(a.keyring)
+    files = [key_path(keyring, n) for n in a.names] if a.names else sorted(keyring.glob("*.key"))
+    out = []
+    for f in files:
+        try:
+            out.append({"name": f.stem, "path": str(f), "mode": _mode(f), "fingerprint": fingerprint(read_key(f))})
+        except KeygenError as exc:
+            out.append({"name": f.stem, "path": str(f), "error": str(exc)})
+    return out
+
+
+def cmd_check(a) -> list[dict]:
+    """Audit: dir 0700, every *.key ok, no stray tmp, not in git, config sane (legacy off)."""
+    keyring = _expand(a.keyring)
+    problems: list[str] = []
+    if not keyring.is_dir():
+        problems.append(f"keyring_ausente: {keyring}")
+    else:
+        if _mode(keyring) != "0700":
+            problems.append(f"keyring_modo: {keyring} {_mode(keyring)} (exige 0700)")
+        top = inside_git_worktree(keyring)
+        if top:
+            problems.append(f"keyring_dentro_de_repo_git: {top}")
+        for f in sorted(keyring.iterdir()):
+            if f.name.endswith(".tmp"):
+                problems.append(f"tmp_orfao: {f}")
+            elif f.suffix == ".key":
+                try:
+                    read_key(f)
+                except KeygenError as exc:
+                    problems.append(str(exc))
+    try:
+        _, cfg_path = load_roster_config(a.config)
+    except KeygenError as exc:
+        problems.append(str(exc))
+    else:
+        problems += check_config(cfg_path, keyring, a.allow_pending_identity)
+    rec = {"keyring": str(keyring), "ok": not problems, "problems": problems,
+           "keys": cmd_fingerprint(argparse.Namespace(keyring=str(keyring), names=[])) if keyring.is_dir() else []}
+    if problems:
+        raise KeygenError(EXIT_UNSAFE, json.dumps(rec, ensure_ascii=False))
+    return [rec]
+
+
+def _toml_fallback(text: str) -> dict:
+    """py<3.11 (macOS /usr/bin/python3 is 3.9): flat `[sec]` + `k = "v" | true | false | [..]`."""
+    data: dict = {}
+    cur: dict = data
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            cur = data
+            for part in line[1:-1].strip().split("."):
+                cur = cur.setdefault(part.strip(), {})
+            continue
+        k, sep, v = line.partition("=")
+        if not sep:
+            raise ValueError("linha_invalida")
+        v = v.split("#", 1)[0].strip() if not v.strip().startswith(('"', "'")) else v.strip()
+        if v in ("true", "false"):
+            cur[k.strip().strip('"')] = v == "true"
+        elif v[:1] in ('"', "'"):
+            cur[k.strip().strip('"')] = v[1:v.index(v[0], 1)]
+        else:
+            cur[k.strip().strip('"')] = v
+    return data
+
+
+def _toml(path: Path) -> dict:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise KeygenError(EXIT_UNSAFE, f"config_ilegivel: {path}") from exc
+    try:
+        import tomllib  # type: ignore[import-not-found]
+    except ModuleNotFoundError:  # pragma: no cover - py<3.11
+        try:
+            return _toml_fallback(text)
+        except (ValueError, IndexError):
+            raise KeygenError(EXIT_UNSAFE, f"config_invalido: {path}") from None
+    try:
+        return tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        raise KeygenError(EXIT_UNSAFE, f"config_invalido: {path}") from None
+
+
+def _as_list(v) -> list[str]:
+    if isinstance(v, str):  # fallback parser keeps TOML arrays as text
+        found = re.findall(r'"([^"]+)"', v)
+        return found if found or v.lstrip().startswith("[") else [v]
+    return [str(x) for x in (v or [])]
+
+
+def _names_with_aliases(data: dict, canon: list[str]) -> set[str]:
+    """Lower-cased names + every roster alias of them (alias keys compared case-insensitively)."""
+    aliases = (data.get("channel_roster") or {}).get("aliases") or {}
+    want = {c.strip().lower() for c in canon}
+    names = set(want)
+    for k, v in aliases.items():
+        if str(k).strip().lower() in want:
+            names.update(x.strip().lower() for x in _as_list(v))
+    names.discard("")
+    return names
+
+
+def _owner_names(data: dict) -> set[str]:
+    """Owner names come only from ``[channel_roster] owner`` plus that name's aliases.
+
+    There is no compiled-in personal name. A config with no owner fails closed in
+    ``refuse_blocked_identities``.
+    """
+    owners = _as_list((data.get("channel_roster") or {}).get("owner"))
+    return _names_with_aliases(data, owners)
+
+
+def _pending_names(data: dict) -> dict[str, set[str]]:
+    """Identities in ``[channel_roster] pending`` plus their aliases.
+
+    They are refused until ``--allow-pending-identity``. Nothing is pending unless
+    the config says so. Names that are also owners stay owners (no flag overrides that).
+    """
+    roster = data.get("channel_roster") or {}
+    pending = [item.strip() for item in _as_list(roster.get("pending")) if str(item).strip()]
+    owners = _owner_names(data)
+    out: dict[str, set[str]] = {}
+    for canon in pending:
+        key = canon.lower()
+        out[key] = _names_with_aliases(data, [canon]) - owners
+    return out
+
+
+DEFAULT_CONFIG = "~/.config/firefly-bridge/config.toml"
+
+
+def load_roster_config(cfg: str | None) -> tuple[dict, Path]:
+    """Same lookup as channel-gh: --config > $FIREFLY_BRIDGE_CONFIG > ~/.config/firefly-bridge/config.toml.
+
+    Fails closed: a named config (flag or env) that cannot be read, or no config at all, is an error;
+    without a roster the owner is unknown and nothing can be checked against it.
+    """
+    env = os.environ.get("FIREFLY_BRIDGE_CONFIG")
+    if cfg or env:
+        path = _expand(cfg or env)
+        if not path.is_file():
+            origem = "--config" if cfg else "$FIREFLY_BRIDGE_CONFIG"
+            raise KeygenError(EXIT_UNSAFE, f"config_ausente: {path} ({origem})")
+        return _toml(path), path
+    path = _expand(DEFAULT_CONFIG)
+    if path.is_file():
+        return _toml(path), path
+    raise KeygenError(EXIT_UNSAFE, "config_ausente: sem --config, sem $FIREFLY_BRIDGE_CONFIG e sem "
+                                   f"{DEFAULT_CONFIG}; sem roster não há como saber quem é o owner")
+
+
+def refuse_blocked_identities(names: list[str], data: dict, allow_pending: bool) -> None:
+    """Single policy for gen, render-config and check.
+
+    Owner (fixed floor + roster owner + aliases): always refused, no flag. A roster without an
+    owner is refused as a whole (owner unknown => fail closed). Pending identities: refused unless
+    allow_pending (--allow-pending-identity).
+    """
+    if not _as_list((data.get("channel_roster") or {}).get("owner")):
+        raise KeygenError(EXIT_UNSAFE, "owner_desconhecido: config sem [channel_roster] owner; "
+                                       "sem ele não há como recusar a identidade do dono")
+    owners, pending = _owner_names(data), _pending_names(data)
+    for n in names:
+        low = n.strip().lower()
+        if low in owners:
+            raise KeygenError(EXIT_UNSAFE, f"identidade_do_owner_recusada: {n!r} ({OWNER_KEY_MSG}; "
+                                           "sem exceção, nenhuma flag libera)")
+        for canon, aliases in pending.items():
+            if low in aliases and not allow_pending:
+                raise KeygenError(EXIT_UNSAFE, f"identidade_pendente_recusada: {n!r} é {canon!r}, que ainda não "
+                                               "aprovou a própria entrada (só ela gera a chave dela, com "
+                                               "--allow-pending-identity)")
+
+
+OWNER_KEY_MSG = (
+    "the configured owner has no key; they speak through a relay signed by relay_principal"
+)
+
+
+def check_config(cfg_path: Path, keyring: Path | None = None, allow_pending: bool = False) -> list[str]:
+    data = _toml(cfg_path)
+    problems = []
+    roster = data.get("channel_roster") or {}
+    owner = roster.get("owner")
+    if not owner:
+        problems.append("config_sem_owner: [channel_roster] owner = \"owner\" é obrigatório")
+    ring_dir = keyring if keyring is not None else (
+        _expand(data["channel_keyring"]["dir"]) if (data.get("channel_keyring") or {}).get("dir") else None)
+    if owner and ring_dir is not None and ring_dir.is_dir():
+        for f in sorted(ring_dir.glob("*.key")):
+            try:
+                refuse_blocked_identities([f.stem], data, allow_pending)
+            except KeygenError as exc:
+                problems.append(f"chave_bloqueada: {f.name}: {exc}")
+    wake = data.get("channel_wake") or {}
+    if wake.get("legacy_unsigned_wake") not in (None, False, "false"):
+        problems.append("legacy_unsigned_wake_ligado: deve ficar false (desligado)")
+    ring = (data.get("channel_keyring") or {}).get("dir")
+    if not ring:
+        problems.append("config_sem_keyring: [channel_keyring] dir ausente (nada verifica => nada acorda)")
+    elif keyring is not None and _expand(ring).resolve() != keyring.resolve():
+        problems.append(f"keyring_divergente: config aponta {ring}, check usa {keyring}")
+    ident = data.get("channel_identity") or {}
+    if ident:
+        name, kf = str(ident.get("name") or ""), str(ident.get("key_file") or "")
+        if not name or not kf:
+            problems.append("identity_incompleta: name e key_file")
+        else:
+            try:
+                read_key(_expand(kf))
+            except KeygenError as exc:
+                problems.append(f"identity_key: {exc}")
+    return problems
+
+
+def cmd_render_config(a) -> list[dict]:
+    base, out, keyring = _expand(a.base), _expand(a.out), _expand(a.keyring)
+    text = base.read_text(encoding="utf-8")
+    data = _toml(base)
+    if "channel_identity" in data:
+        raise KeygenError(EXIT_USAGE, "base_ja_tem_[channel_identity]: use o config compartilhado (sem identidade)")
+    base_ring = (data.get("channel_keyring") or {}).get("dir")
+    if base_ring and _expand(base_ring).resolve() != keyring.resolve():
+        raise KeygenError(EXIT_USAGE, f"keyring_divergente: base aponta {base_ring}, --keyring é {keyring}")
+    if (data.get("channel_wake") or {}).get("legacy_unsigned_wake") not in (None, False, "false"):
+        raise KeygenError(EXIT_UNSAFE, "base_com_legacy_unsigned_wake_ligado")
+    refuse_blocked_identities([a.name], data, a.allow_pending_identity)
+    kf = key_path(keyring, a.name)
+    read_key(kf)  # must already exist and be safe; never read into output
+    if out.exists() and not a.force:
+        raise KeygenError(EXIT_EXISTS, f"config_existe: {out} (use --force)")
+    body = text.rstrip("\n") + (
+        "\n\n# --- gerado por channel-keygen render-config (só caminhos; nenhum segredo) ---\n"
+        f"[channel_identity]\nname = \"{a.name}\"\nkey_file = \"{kf}\"\n"
+        + ("" if base_ring else f"\n[channel_keyring]\ndir = \"{keyring}\"\n"))
+    out.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = out.with_name(f".{out.name}.{secrets.token_hex(8)}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(body)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, out)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+    problems = check_config(out, keyring, a.allow_pending_identity)
+    return [{"config": str(out), "name": a.name, "key_file": str(kf), "mode": _mode(out), "problems": problems}]
+
+
+def cmd_revoke(a) -> list[dict]:
+    if not a.yes:
+        raise KeygenError(EXIT_USAGE, "revoke exige --yes (apaga a chave do keyring)")
+    keyring = _expand(a.keyring)
+    t = key_path(keyring, a.name)
+    if not t.exists():
+        raise KeygenError(EXIT_USAGE, f"chave_ausente: {t}")
+    try:
+        fp = fingerprint(read_key(t))
+    except KeygenError:
+        fp = "ilegivel"
+    size = t.stat().st_size
+    with open(t, "r+b", buffering=0) as f:  # best effort overwrite (APFS/SSD: not a guarantee)
+        f.write(secrets.token_bytes(size))
+        os.fsync(f.fileno())
+    t.unlink()
+    _fsync_dir(keyring)
+    return [{"name": a.name, "path": str(t), "revoked_fingerprint": fp, "removed": True}]
+
+
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(prog="channel-keygen", description=__doc__.split("\n\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    g = sub.add_parser("gen", help="gera chave(s) nova(s); nunca sobrescreve sem --force")
+    g.add_argument("--keyring", required=True)
+    g.add_argument("names", nargs="+")
+    g.add_argument("--force", action="store_true", help="rotaciona: substitui atomicamente a chave existente")
+    g.add_argument("--allow-git-worktree", action="store_true", help=argparse.SUPPRESS)
+    g.add_argument("--config", default=None,
+                   help="config com [channel_roster] owner/aliases; padrão: $FIREFLY_BRIDGE_CONFIG, senão "
+                        "~/.config/firefly-bridge/config.toml. Sem config o gen recusa (owner desconhecido).")
+    g.add_argument("--allow-pending-identity", action="store_true",
+                   help="libera peerb/peera/peera-peerb — só a própria peerb, depois do ok dela no PR #1. "
+                        "Nunca libera o owner (owner/ownernick/aliases).")
+    f = sub.add_parser("fingerprint", help="impressão digital (nunca o segredo)")
+    f.add_argument("--keyring", required=True)
+    f.add_argument("names", nargs="*")
+    c = sub.add_parser("check", help="audita permissões, tmp órfão, git, config")
+    c.add_argument("--keyring", required=True)
+    c.add_argument("--config", default=None, help="padrão: $FIREFLY_BRIDGE_CONFIG, senão ~/.config/firefly-bridge/config.toml")
+    c.add_argument("--allow-pending-identity", action="store_true", help="aceita a chave da identidade pendente")
+    r = sub.add_parser("render-config", help="config por terminal = base + [channel_identity]/[channel_keyring]")
+    r.add_argument("--base", required=True)
+    r.add_argument("--name", required=True)
+    r.add_argument("--keyring", required=True)
+    r.add_argument("--out", required=True)
+    r.add_argument("--force", action="store_true")
+    r.add_argument("--allow-pending-identity", action="store_true", help="libera a identidade pendente (peerb)")
+    v = sub.add_parser("revoke", help="remove a chave do keyring (verificação passa a dar unknown_key)")
+    v.add_argument("--keyring", required=True)
+    v.add_argument("name")
+    v.add_argument("--yes", action="store_true")
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    os.umask(0o077)
+    a = build_parser().parse_args(argv)
+    fn = {"gen": cmd_gen, "fingerprint": cmd_fingerprint, "check": cmd_check,
+          "render-config": cmd_render_config, "revoke": cmd_revoke}[a.cmd]
+    try:
+        for rec in fn(a):
+            print(json.dumps(rec, ensure_ascii=False))
+    except KeygenError as exc:
+        print(f"channel-keygen: {exc}", file=sys.stderr)
+        return exc.code
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())

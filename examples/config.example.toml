@@ -1,0 +1,155 @@
+# Copy to $XDG_CONFIG_HOME/firefly-bridge/config.toml (or pass --config).
+# Every value can also be set with FIREFLY_BRIDGE_<FIELD> (upper case).
+
+[bridge]
+# Leader socket of the target grok-tui (placeholders only in this example).
+socket_path = "~/.grok/leader-example.sock"
+session_id  = "sess-example-0001"
+session_cwd = "~/Projects/example-workspace"
+grok_bin    = "grok"
+
+sender = "agent-a"
+prefix = "agent-a: "
+auth_mode = "prefix"          # "prefix" | "hmac"
+# hmac_key_file = "~/.config/firefly-bridge/hmac.key"
+
+connect_timeout_s = 30
+load_timeout_s    = 120
+turn_timeout_s    = 600
+cancel_grace_s    = 15
+busy_wait_s       = 1800
+busy_policy       = "wait"    # "wait" | "fail"
+max_outbox        = 3
+poll_interval_s   = 0.5
+
+live_send = false
+# Strict GROK_SANDBOX has been observed to hang session attach.
+# Only enable the next flag if you accept that risk (see THREAT_MODEL.md).
+strip_grok_sandbox = false
+
+# Placeholder agents. Rename them here; every mode below defaults to pending.
+agents = ["agent-a", "agent-b", "agent-c"]
+agent_a_permission_mode = "pending"  # or "allowlist_shared". allow_all_own_turns is opt-in and off.
+agent_b_permission_mode = "pending"
+agent_c_permission_mode = "pending"
+# Extra agents named in `agents` stay pending unless listed here.
+# [bridge.permission_mode_overrides]
+# role-1 = "pending"
+shared_dir = "shared/"
+allowed_tool_kinds = ["edit"]
+
+# state_dir = "~/.local/state/firefly-bridge"
+
+# Separate credentials per IPC principal. Never commit keys.
+ipc_keys_dir = "~/.config/firefly-bridge/keys"
+ipc_principal = "agent-a"     # client config; human/recipient use separate keys
+ipc_key_file = "~/.config/firefly-bridge/keys/agent-a.key"
+# Use a DIFFERENT state_dir per pinned destination.
+# state_dir = "~/.local/state/firefly-bridge/example"
+per_sender_pending = 1
+per_sender_daily_quota = 3
+sender_interval_s = 1800
+global_interval_s = 0  # deprecated name; if nonzero, a PER-SENDER cooldown floor
+admission_max_age_s = 5
+max_body_bytes = 32000
+max_reply_bytes = 64000
+max_queue_bytes = 96000
+
+# Independent protected-tool gate, also enforced in allow_all_own_turns.
+# General-gate opt-out permits opaque broad approvals; RC5 authority invariants remain mandatory.
+protected_tools_enabled = true
+# Below 60/600 requires the separate explicit opt-out pacing_minimums_enabled=false.
+pacing_minimums_enabled = true
+post_turn_interval_s = 60
+target_interval_s = 600  # target-wide; global_interval_s remains a legacy sender floor
+quiet_hours_start = ""  # set both HH:MM values, e.g. "22:00" and "08:00"
+quiet_hours_end = ""
+quiet_hours_timezone = "UTC"
+
+
+# Optional channel/watch-wake paths (same file, ignored by the daemon loader).
+# Copy values to $XDG_CONFIG_HOME/firefly-bridge/config.toml; never commit a live file.
+[channel]
+socket_path = "~/.grok/leader-example.sock"
+session_id  = "sess-example-0001"
+session_cwd = "~/Projects/example-workspace"
+grok_bin    = "grok"
+ledger_path = "~/.local/state/firefly-bridge/ledger.json"
+hold_pid_file = "~/.local/state/firefly-bridge/hold.pid"
+approvals_log_path = "~/.local/state/firefly-bridge/auto-approvals.jsonl"
+wake_dir = "~/.local/share/firefly-bridge/wake-notes"
+wake_filename = "WAKE.md"
+reply_prefix = "reply_"
+inbound_dir = "memory/shared/inbound"
+# updates_jsonl_path is derived from session_cwd + session_id when omitted
+
+# Async GitHub PR channel (channel-gh). Use placeholders only in this example.
+[github_canal]
+repo = "Owner/channel-canal"
+pr = "1"
+
+# VIP roster: scripts/channel-call (via channel-gh roster) and firefly_bridge.speaker.
+# Missing/empty => nobody is VIP (fail closed). GitHub login is never speaker.
+[channel_roster]
+vip = ["agent-a", "agent-b", "agent-c", "agent-d", "owner", "peerx"]
+# Owner: waking a terminal in the owner's name ALWAYS needs a verified channel-sig from the
+# owner (also with no keyring). `— owner` / `de: owner` in the body alone never wakes anyone.
+owner = "owner"
+# Names in pending cannot get a key until --allow-pending-identity. Empty means none.
+pending = []
+# Who may sign an agent-relay. Default agent-a when this key is omitted.
+relay_principal = "agent-a"
+
+# Spelling only; never makes anyone VIP. "peerc" alone is NOT an alias.
+[channel_roster.aliases]
+agent-d = ["agentdext", "agent-d[ext]", "agent-d-alt"]
+owner = ["ownernick", "ownerlogin"]
+peerx = ["peerxb"]
+
+# Canal HMAC (opt-in). With no [channel_identity] posts go out unsigned (legacy);
+# with no [channel_keyring] nothing is verified (auth "no_keyring"). Keys: 0600, one per sender,
+# made with `scripts/channel-keygen gen --config THIS_FILE --keyring DIR NOME` (never printed;
+# see docs/KEYGEN.md). Do not commit keys.
+# agent-d-alt 1: only agent-a signs; peerb generates her own key once she opts in. There is no owner key
+# (no owner.key): the keygen refuses it, and owner speaks through a agent-a-signed relay.
+# [channel_identity]
+# name = "agent-a"
+# key_file = "~/.config/channel/keyring/agent.key"   # the SAME file the keyring holds (HMAC = one secret)
+#
+# [channel_keyring]
+# dir = "~/.config/channel/keyring"   # <dir>/<nome>.key for every sender this terminal verifies
+#
+# Wake authority (R3): ONLY a verified channel-sig grants it. Markers (`<!-- channel-bot -->`,
+# `<!-- agent-relay -->`), `de:` and `— Nome` without a valid trailer are display text: the
+# message is still sent, delivered and shown (marked "não verificado"), it just wakes nobody.
+# Cost: with no [channel_keyring] nothing verifies, so NOTHING wakes. Opt in to the pre-HMAC
+# rule for non-owner VIPs only while keys are being rolled out (owner still needs his signature):
+# [channel_wake]
+# legacy_unsigned_wake = false
+
+# Presence/occupancy before wake/knock (firefly_bridge.presence; read-only, dry-run design).
+# Only a VIP-gated wake reads presence; only "idle" knocks. busy/absent/unknown/stale => deferred.
+[channel_presence]
+max_age_s = 120  # writer cadence 30 s => ~4 beats
+future_skew_s = 30
+# DECIDED: nobody knocks on a BUSY terminal (owner included). Hook kept off; it could only ever
+# apply to an HMAC-verified sender (sender_verified) listed below.
+allow_busy_override = false
+busy_override_principals = []
+# Queue = the ONE re-tryer of deferred_busy/deferred_unknown: backoff 30 s doubling, cap 600 s;
+# after max_deferred_attempts refusals -> deferred_expired, message stays in the PR/inbox.
+max_deferred_attempts = 8
+backoff_base_s = 30
+backoff_cap_s = 600
+
+# terminal name -> heartbeat JSON the terminal itself writes, e.g.
+# {"name": "Example", "ts": 1763130000, "state": "busy", "task": "..."}
+[channel_presence.terminals]
+Example = "~/.local/state/firefly-bridge/presence/example.json"
+
+# Optional outbox persistence across daemon restarts (firefly_bridge.queue_store).
+# Without this section, or with state_path omitted/empty, the queue stays memory-only
+# (identical to pre-persist behaviour). Path is local to the box; do not put secrets
+# in the file (HMAC keys and tokens are never written). Uncomment to enable:
+# [channel_queue]
+# state_path = "/var/tmp/firefly-bridge-example/outbox.json"

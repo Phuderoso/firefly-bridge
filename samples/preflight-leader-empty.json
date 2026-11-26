@@ -1,0 +1,72 @@
+{
+  "busy_query_documented": false,
+  "coordinated_restart_performed": false,
+  "disk_load_is_live_attachment": false,
+  "gates": [
+    {
+      "detail": "Vendor text does not say a second client joins the running TUI session.",
+      "id": "contract_attach",
+      "pass": false
+    },
+    {
+      "detail": "No documented busy query or non-steering queue. Do not send.",
+      "id": "noninterruption",
+      "pass": false
+    },
+    {
+      "detail": "Draft-buffer preservation is not documented.",
+      "id": "composer",
+      "pass": false
+    },
+    {
+      "detail": "agent-a is not a documented ACP speaker. Receipt attribution only.",
+      "id": "speaker",
+      "pass": false
+    },
+    {
+      "detail": "The documented existing-session ACP method is session/load, which replays history.",
+      "id": "not_disk_load",
+      "pass": false
+    },
+    {
+      "detail": "no_leader_in_this_output. Same shape as an earlier empty list: nothing discovered in this output, not impossibility, and not proof the TUI is isolated.",
+      "id": "leader_observed",
+      "informational": true,
+      "pass": false
+    },
+    {
+      "detail": "pinned id did not appear in this directory's list output. Do not fall back to the most recent session or to session/new.",
+      "id": "session_pinned_seen",
+      "informational": true,
+      "pass": false
+    },
+    {
+      "detail": "This preflight does not restart peerb or edit config. A restart would be a separate coordinated change and still would not open the send gate.",
+      "id": "no_restart",
+      "pass": true
+    }
+  ],
+  "leader_interpretation": "no_leader_in_this_output. Same shape as an earlier empty list: nothing discovered in this output, not impossibility, and not proof the TUI is isolated.",
+  "live_send_allowed": false,
+  "noninterruption_guaranteed": false,
+  "observation": {
+    "commands": [
+      "grok version",
+      "grok leader list --help",
+      "grok leader list --json",
+      "grok sessions list --limit 50"
+    ],
+    "grok_found": true,
+    "grok_version": "grok 1.0.70 (f50904eaee6c)",
+    "leader_count": 0,
+    "leader_json_shape": "list",
+    "leader_list_ran": true,
+    "pinned_session_id_provided": true,
+    "pinned_session_id_seen": false,
+    "sessions_list_ran": true
+  },
+  "retrieved": "2026-11-08",
+  "send_authorized_by_passing_gates": false,
+  "send_remains_blocked_because": "Non-interruption is not guaranteed by the retrieved contract. session/load remains a history replay. This report does not authorize a send.",
+  "session_interpretation": "pinned id did not appear in this directory's list output. Do not fall back to the most recent session or to session/new."
+}
